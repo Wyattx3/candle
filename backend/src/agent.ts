@@ -95,18 +95,21 @@ const MODEL_NAME = process.env.MODEL_NAME || "@cf/moonshotai/kimi-k2.6";
 const agentLLM = new ChatOpenAI({
   modelName: MODEL_NAME,
   temperature: 0,
+  streaming: true,
   ...cfConfig,
 }).bindTools(tools, { tool_choice: "auto" });
 
 const noToolsLLM = new ChatOpenAI({
   modelName: MODEL_NAME,
   temperature: 0.2,
+  streaming: true,
   ...cfConfig,
 });
 
 const researchLLM = new ChatOpenAI({
   modelName: MODEL_NAME,
   temperature: 0.4,
+  streaming: true,
   ...cfConfig,
 }).bindTools(tools, { tool_choice: "auto" });
 
@@ -1341,7 +1344,7 @@ export async function runAgentStream(
         console.log(`[tool:start] ▶ ${name}`);
         console.log(`[tool:start]   run_id : ${run_id}`);
         console.log(`[tool:start]   input  : ${compactValue(toolInput).slice(0, 400)}`);
-        emitEvent({ type: "tool_start", toolName: name, input: redactSecretsDeep(toolInput) });
+        emitEvent({ type: "tool_start", toolName: name, input: redactSecretsDeep(toolInput), toolIndex: runCtx.toolCallCount, budget: runCtx.budget.maxToolCalls });
       } else if (eventType === "on_tool_end") {
         const startedAt = toolStartTimes.get(run_id);
         const elapsed = startedAt ? `${Date.now() - startedAt}ms` : "?ms";
