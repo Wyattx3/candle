@@ -60,6 +60,12 @@ wss.on("connection", (ws: WebSocket, req) => {
     let runId = 0;
     try {
       const data = JSON.parse(message);
+
+      // Heartbeat: respond to ping immediately
+      if (data.type === "ping") {
+        sendIfOpen({ type: "pong" });
+        return;
+      }
       
       if (data.type === "prompt") {
         const prompt = data.content;
@@ -93,15 +99,22 @@ wss.on("connection", (ws: WebSocket, req) => {
         console.log(`[ws]   history: ${history.length} messages`);
         
         sendIfOpen({ type: "status", content: "Agent started..." });
+        // Immediately signal that the agent is thinking (reduces perceived latency)
+        sendIfOpen({ type: "thinking", content: true });
 
         const emitEvent = (event: any) => {
           if (runId === activeRunId && !activeController?.signal.aborted) {
             // Log tool events at ws level too for easy tracing
             if (event.type === "tool_start") {
               console.log(`[ws] → emit tool_start: ${event.toolName}`);
+              // Attach progress info so client can show "Step 2/30"
+              event.progress = { current: event.toolIndex ?? 0, budget: event.budget ?? 0 };
             } else if (event.type === "tool_end") {
               const preview = String(event.output ?? "").slice(0, 120).replace(/\n/g, " ");
               console.log(`[ws] → emit tool_end:   ${event.toolName} | ${preview}`);
+            } else if (event.type === "thought_chunk") {
+              // First thought chunk means model started responding — stop thinking indicator
+              sendIfOpen({ type: "thinking", content: false });
             } else if (event.type === "error") {
               console.error(`[ws] → emit error: ${event.content}`);
             }
@@ -132,6 +145,8 @@ wss.on("connection", (ws: WebSocket, req) => {
     } catch (e: any) {
       if (activeController?.signal.aborted || e instanceof AgentAbortError || e?.name === "AbortError") {
         console.log(`[ws] ✗ run#${runId} cancelled`);
+        sendIfOpen({ type: "status", content: "Cancelled." });
+        sendIfOpen({ type: "cancelled", runId });
         releaseConcurrencySlot();
         return;
       }
@@ -188,6 +203,8 @@ function getMaxHistoryChars() {
   return Math.max(2_000, Math.min(120_000, Math.floor(parsed)));
 }
 
+const MAX_SINGLE_MESSAGE_CHARS = Number(process.env.MAX_SINGLE_MESSAGE_CHARS) || 12_000;
+
 function trimChatHistory(messages: ChatHistoryMessage[]) {
   const maxMessages = getMaxHistoryMessages();
   const maxChars = getMaxHistoryChars();
@@ -198,7 +215,7 @@ function trimChatHistory(messages: ChatHistoryMessage[]) {
   for (let i = trimmed.length - 1; i >= 0; i -= 1) {
     const message = {
       ...trimmed[i],
-      content: redactSecrets(trimmed[i].content).slice(0, 12_000),
+      content: redactSecrets(trimmed[i].content).slice(0, MAX_SINGLE_MESSAGE_CHARS),
     };
     const nextUsed = used + message.content.length;
     if (kept.length > 0 && nextUsed > maxChars) break;

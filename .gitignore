@@ -52,3 +52,8 @@ backend/.env
 # backend build
 backend/dist/
 backend/build/
+
+# local browser and tunnel artifacts
+.playwright-mcp/
+*.exe
+cloudflare-tunnel.yml

@@ -1,5 +1,6 @@
 import React from 'react';
-import { View, Text } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
+import { LiquidGlass } from './LiquidGlass';
 
 interface ChatBubbleProps {
   message: string;
@@ -7,29 +8,67 @@ interface ChatBubbleProps {
 
 export function UserBubble({ message }: ChatBubbleProps) {
   return (
-    <View className="flex-row justify-end mb-8 px-6 w-full">
-      <View className="bg-[#F3F4F6] rounded-[18px] px-5 py-4 max-w-[85%] border border-[#E5E7EB]/50">
-        <Text className="text-[#1A1A1A] text-[16px] leading-[24px] font-medium tracking-tight">
-          {message}
-        </Text>
-      </View>
+    <View style={styles.userRow}>
+      <LiquidGlass
+        variant="regular"
+        borderRadius={21}
+        intensity={66}
+        style={styles.userGlass}
+        contentStyle={styles.userContent}
+      >
+        <Text style={styles.userText}>{message}</Text>
+      </LiquidGlass>
     </View>
   );
 }
 
 export function AgentBubble({ message }: ChatBubbleProps) {
   return (
-    <View className="flex-row justify-start mb-8 px-6 w-full">
-      {/* 
-        Manus Style: 
-        No avatar. Just clean, highly legible text flush left. 
-        Large line height, dark charcoal color for maximum readability.
-      */}
-      <View className="flex-1 max-w-[95%]">
-        <Text className="text-[#1A1A1A] text-[16px] leading-[28px] tracking-tight">
-          {message}
-        </Text>
+    <View style={styles.agentRow}>
+      <View style={styles.agentContent}>
+        <Text style={styles.agentText}>{message}</Text>
       </View>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  userRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginBottom: 8,
+    paddingHorizontal: 20,
+    width: '100%',
+  },
+  userGlass: {
+    maxWidth: '85%',
+  },
+  userContent: {
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  userText: {
+    color: '#1C1C1E',
+    fontSize: 16,
+    lineHeight: 22,
+    fontWeight: '500',
+    letterSpacing: 0,
+  },
+  agentRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+    marginBottom: 8,
+    paddingHorizontal: 20,
+    width: '100%',
+  },
+  agentContent: {
+    flex: 1,
+    maxWidth: '95%',
+  },
+  agentText: {
+    color: '#1C1C1E',
+    fontSize: 16,
+    lineHeight: 26,
+    letterSpacing: 0,
+  },
+});

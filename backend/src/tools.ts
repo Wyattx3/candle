@@ -7,8 +7,8 @@ import { z } from "zod";
 // We'll manage a singleton E2B sandbox for the duration of the agent run
 export let sandbox: any = null;
 let currentTemplate = "";
-let defaultE2BTemplate = "lxq0wfatmw3i42mooiea";
-const SANDBOX_TIMEOUT_MS = 900_000;
+let defaultE2BTemplate = process.env.E2B_TEMPLATE_ID || process.env.E2B_TEMPLATE_NAME || "lxq0wfatmw3i42mooiea";
+const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS) || 900_000;
 let sandboxLock: Promise<void> = Promise.resolve();
 
 const E2B_TEMPLATES = [
@@ -806,43 +806,246 @@ function stripHtml(value: string) {
   return cheerio.load(`<div>${value}</div>`)("div").text().replace(/\s+/g, " ").trim();
 }
 
+/**
+ * ============================================================================
+ * SEARCH RESULT CACHE
+ * ============================================================================
+ * Avoids repeating the same query within a short window.
+ */
+const searchCache = new Map<string, { results: any[]; timestamp: number }>();
+const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 120_000; // 2 minutes
+
+function getCachedSearch(query: string): any[] | null {
+  const key = query.toLowerCase().trim();
+  const entry = searchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > SEARCH_CACHE_TTL_MS) {
+    searchCache.delete(key);
+    return null;
+  }
+  return entry.results;
+}
+
+function setCachedSearch(query: string, results: any[]) {
+  const key = query.toLowerCase().trim();
+  searchCache.set(key, { results, timestamp: Date.now() });
+  // Evict old entries
+  if (searchCache.size > 50) {
+    const oldest = [...searchCache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+    for (let i = 0; i < 10; i++) searchCache.delete(oldest[i][0]);
+  }
+}
+
+/**
+ * ============================================================================
+ * SEARCH PROVIDERS
+ * ============================================================================
+ */
+
+async function searchViaYouCom(query: string, targetCount: number): Promise<any[] | null> {
+  const apiKey = process.env.YOUCOM_API_KEY?.trim();
+  if (!apiKey) return null;
+
+  try {
+    const params = new URLSearchParams({
+      query,
+      count: String(Math.min(Math.max(targetCount, 1), 20)),
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12_000);
+
+    const response = await fetch(`https://ydc-index.io/v1/search?${params.toString()}`, {
+      method: "GET",
+      headers: {
+        "X-API-Key": apiKey,
+        "Accept": "application/json",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as any;
+    const webResults: any[] = data?.results?.web ?? data?.hits ?? [];
+    const newsResults: any[] = data?.results?.news ?? [];
+
+    const merged: any[] = [];
+    for (const r of webResults) {
+      const snippet = (r.snippets && r.snippets.join(" ")) || r.description || "";
+      merged.push({
+        title: r.title || "",
+        url: r.url || "",
+        snippet: snippet.slice(0, 400),
+        publishedDate: r.page_age || null,
+        source: "you.com",
+      });
+    }
+    for (const r of newsResults) {
+      merged.push({
+        title: r.title || "",
+        url: r.url || "",
+        snippet: (r.description || "").slice(0, 400),
+        publishedDate: r.page_age || null,
+        source: "you.com:news",
+      });
+    }
+
+    if (merged.length === 0) return null;
+    return merged.slice(0, targetCount).map((r, i) => ({ rank: i + 1, ...r }));
+  } catch {
+    return null;
+  }
+}
+
+async function searchViaDuckDuckGo(query: string, targetCount: number): Promise<any[] | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+
+    // DuckDuckGo HTML lite endpoint (no API key needed)
+    const params = new URLSearchParams({ q: query, kl: "us-en" });
+    const response = await fetch(`https://html.duckduckgo.com/html/?${params.toString()}`, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    const results: any[] = [];
+
+    $(".result").each((_, el) => {
+      if (results.length >= targetCount) return;
+      const titleEl = $(el).find(".result__a");
+      const snippetEl = $(el).find(".result__snippet");
+      const title = titleEl.text().trim();
+      let url = titleEl.attr("href") || "";
+
+      // DuckDuckGo wraps URLs in a redirect
+      if (url.startsWith("//duckduckgo.com/l/?uddg=")) {
+        try {
+          const parsed = new URL(`https:${url}`);
+          url = decodeURIComponent(parsed.searchParams.get("uddg") || url);
+        } catch {}
+      }
+
+      if (!title || !url || !/^https?:\/\//.test(url)) return;
+
+      results.push({
+        rank: results.length + 1,
+        title,
+        url,
+        snippet: snippetEl.text().trim().slice(0, 400),
+        source: "duckduckgo",
+      });
+    });
+
+    return results.length > 0 ? results : null;
+  } catch {
+    return null;
+  }
+}
+
+async function searchViaBrave(query: string, targetCount: number): Promise<any[] | null> {
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY?.trim();
+  if (!apiKey) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+
+    const params = new URLSearchParams({
+      q: query,
+      count: String(Math.min(targetCount, 20)),
+      text_decorations: "false",
+      search_lang: "en",
+    });
+
+    const response = await fetch(`https://api.search.brave.com/res/v1/web/search?${params.toString()}`, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "X-Subscription-Token": apiKey,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as any;
+    const webResults: any[] = data?.web?.results ?? [];
+
+    if (webResults.length === 0) return null;
+
+    return webResults.slice(0, targetCount).map((r, i) => ({
+      rank: i + 1,
+      title: r.title || "",
+      url: r.url || "",
+      snippet: (r.description || "").slice(0, 400),
+      publishedDate: r.page_age || r.age || null,
+      source: "brave",
+    }));
+  } catch {
+    return null;
+  }
+}
+
 async function searchGoogleCustomSearch(query: string, targetCount: number) {
   const apiKey = process.env.GOOGLE_SEARCH_API_KEY?.trim();
   const cx = process.env.GOOGLE_SEARCH_CX?.trim();
   if (!apiKey || !cx) return undefined;
 
-  const results: any[] = [];
-  for (let start = 1; results.length < targetCount && start <= 91; start += 10) {
-    const url = new URL("https://www.googleapis.com/customsearch/v1");
-    url.searchParams.set("key", apiKey);
-    url.searchParams.set("cx", cx);
-    url.searchParams.set("q", query);
-    url.searchParams.set("num", String(Math.min(10, targetCount - results.length)));
-    url.searchParams.set("start", String(start));
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12_000);
 
-    const response = await fetch(url);
-    const payload = await response.json() as any;
-    if (!response.ok) {
-      throw new Error(`Google Custom Search API failed (${response.status}): ${payload?.error?.message || response.statusText}`);
+    const results: any[] = [];
+    for (let start = 1; results.length < targetCount && start <= 91; start += 10) {
+      const url = new URL("https://www.googleapis.com/customsearch/v1");
+      url.searchParams.set("key", apiKey);
+      url.searchParams.set("cx", cx);
+      url.searchParams.set("q", query);
+      url.searchParams.set("num", String(Math.min(10, targetCount - results.length)));
+      url.searchParams.set("start", String(start));
+
+      const response = await fetch(url, { signal: controller.signal });
+      const payload = await response.json() as any;
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        console.warn(`[search:google] API error ${response.status}: ${payload?.error?.message || ""}`);
+        break;
+      }
+
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      if (!items.length) break;
+      for (const item of items) {
+        if (results.length >= targetCount) break;
+        const resultUrl = String(item.link || "");
+        if (!/^https?:\/\//i.test(resultUrl)) continue;
+        results.push({
+          rank: results.length + 1,
+          title: String(item.title || "").trim(),
+          url: resultUrl,
+          snippet: stripHtml(String(item.htmlSnippet || item.snippet || "")).slice(0, 400),
+          source: "google_api",
+        });
+      }
     }
 
-    const items = Array.isArray(payload.items) ? payload.items : [];
-    if (!items.length) break;
-    for (const item of items) {
-      if (results.length >= targetCount) break;
-      const resultUrl = String(item.link || "");
-      if (!/^https?:\/\//i.test(resultUrl)) continue;
-      results.push({
-        rank: results.length + 1,
-        title: String(item.title || "").trim(),
-        url: resultUrl,
-        snippet: stripHtml(String(item.htmlSnippet || item.snippet || "")).slice(0, 320),
-        source: "google_custom_search",
-      });
-    }
+    return results.length > 0 ? results : undefined;
+  } catch {
+    return undefined;
   }
-
-  return results;
 }
 
 function isGoogleInternalUrl(url: string) {
@@ -1131,45 +1334,35 @@ async function searchGoogleViaKernel(query: string, targetCount: number) {
   }, { timeoutMs: 120_000, headless: false, useResidentialProxy: true });
 }
 
-async function searchViaExa(query: string, targetCount: number): Promise<any[] | null> {
-  const apiKey = process.env.EXA_API_KEY?.trim();
-  if (!apiKey) return null;
+/**
+ * ============================================================================
+ * IMPROVED SEARCH: PARALLEL + DEDUP + MERGE
+ * ============================================================================
+ */
 
-  try {
-    const response = await fetch("https://api.exa.ai/search", {
-      method: "POST",
-      headers: {
-        "x-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query,
-        numResults: Math.min(targetCount, 25),
-        type: "auto",
-        contents: {
-          highlights: true,
-          summary: true,
-        },
-      }),
-    });
+function deduplicateResults(results: any[], targetCount: number): any[] {
+  const seen = new Set<string>();
+  const deduped: any[] = [];
 
-    if (!response.ok) return null;
+  for (const r of results) {
+    if (deduped.length >= targetCount) break;
+    if (!r.url) continue;
 
-    const data = await response.json() as any;
-    if (!data.results || !Array.isArray(data.results) || data.results.length === 0) return null;
+    // Normalize URL for dedup (strip trailing slash, www, protocol)
+    let normalized: string;
+    try {
+      const u = new URL(r.url);
+      normalized = u.hostname.replace(/^www\./, "") + u.pathname.replace(/\/+$/, "") + u.search;
+    } catch {
+      normalized = r.url;
+    }
 
-    return data.results.map((r: any, i: number) => ({
-      rank: i + 1,
-      title: r.title || "",
-      url: r.url || "",
-      snippet: r.summary || (r.highlights && r.highlights[0]) || "",
-      publishedDate: r.publishedDate || null,
-      author: r.author || null,
-      source: "exa",
-    }));
-  } catch {
-    return null;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push({ ...r, rank: deduped.length + 1 });
   }
+
+  return deduped;
 }
 
 export const searchWebTool = tool(
@@ -1177,26 +1370,66 @@ export const searchWebTool = tool(
     try {
       const targetCount = boundedSearchResultCount(max_results);
 
-      // 1. Exa AI search (fastest — pure API, no browser)
-      const exaResults = await searchViaExa(query, targetCount);
-      if (exaResults && exaResults.length > 0) return JSON.stringify(exaResults);
+      // Check cache first
+      const cached = getCachedSearch(query);
+      if (cached) {
+        console.log(`[search] cache hit for: ${query.slice(0, 60)}`);
+        return JSON.stringify(cached.slice(0, targetCount));
+      }
 
-      // 2. Google Custom Search API
-      const apiResults = await searchGoogleCustomSearch(query, targetCount);
-      if (apiResults && apiResults.length > 0) return JSON.stringify(apiResults);
+      // Run fast API-based providers in parallel
+      const [youResults, braveResults, ddgResults, googleApiResults] = await Promise.allSettled([
+        searchViaYouCom(query, targetCount),
+        searchViaBrave(query, targetCount),
+        searchViaDuckDuckGo(query, targetCount),
+        searchGoogleCustomSearch(query, targetCount),
+      ]);
 
-      // 3. Google via Kernel stealth browser + residential proxy
+      // Collect all successful results, prioritizing by quality
+      const allResults: any[] = [];
+
+      // Priority 1: you.com (best snippets)
+      if (youResults.status === "fulfilled" && youResults.value) {
+        allResults.push(...youResults.value);
+      }
+      // Priority 2: Brave (good quality, fast)
+      if (braveResults.status === "fulfilled" && braveResults.value) {
+        allResults.push(...braveResults.value);
+      }
+      // Priority 3: Google Custom Search API
+      if (googleApiResults.status === "fulfilled" && googleApiResults.value) {
+        allResults.push(...googleApiResults.value);
+      }
+      // Priority 4: DuckDuckGo (no API key, always available)
+      if (ddgResults.status === "fulfilled" && ddgResults.value) {
+        allResults.push(...ddgResults.value);
+      }
+
+      // Deduplicate and take top results
+      if (allResults.length > 0) {
+        const final = deduplicateResults(allResults, targetCount);
+        setCachedSearch(query, final);
+        console.log(`[search] ${final.length} results for: ${query.slice(0, 60)} (sources: ${[...new Set(final.map(r => r.source))].join(", ")})`);
+        return JSON.stringify(final);
+      }
+
+      // Fallback: Google via Kernel stealth browser (slowest but most reliable)
+      console.log(`[search] all fast providers failed, falling back to Kernel browser for: ${query.slice(0, 60)}`);
       const googleResults = await searchGoogleViaKernel(query, targetCount);
-      if (Array.isArray(googleResults) && googleResults.length > 0) return JSON.stringify(googleResults);
+      if (Array.isArray(googleResults) && googleResults.length > 0) {
+        const final = deduplicateResults(googleResults, targetCount);
+        setCachedSearch(query, final);
+        return JSON.stringify(final);
+      }
 
-      return JSON.stringify([{ rank: 1, title: "No results found", url: "", snippet: "Search returned no results for this query. Try different keywords.", source: "none" }]);
+      return JSON.stringify([{ rank: 1, title: "No results found", url: "", snippet: "Search returned no results for this query. Try different keywords or rephrase.", source: "none" }]);
     } catch (e: any) {
       return `Failed to search web: ${e.message}`;
     }
   },
   {
     name: "search_web",
-    description: "Search the web via Exa AI neural search or Google. Returns structured results with titles, URLs, snippets, and summaries. Fast and reliable.",
+    description: "Search the web using multiple providers in parallel (you.com, Brave, DuckDuckGo, Google). Returns deduplicated structured results with titles, URLs, and snippets. Fast and reliable.",
     schema: z.object({
       query: z.string().describe("The search query."),
       max_results: z.number().optional().describe("How many organic results to return. Defaults to 10; maximum 25."),

@@ -1,19 +1,20 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { View, KeyboardAvoidingView, Platform, StyleSheet, Text, TouchableOpacity, Animated, Easing, ScrollView, LayoutAnimation, UIManager, Dimensions } from 'react-native';
-import { FlashList } from '@shopify/flash-list';
 import type { FlashListRef } from '@shopify/flash-list';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
+import { FlashList } from '@shopify/flash-list';
 import Constants from 'expo-constants';
+import { LinearGradient } from 'expo-linear-gradient';
 import * as WebBrowser from 'expo-web-browser';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Animated, Dimensions, Easing, KeyboardAvoidingView, LayoutAnimation, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { Header } from '../components/Header';
-import { WelcomeState } from '../components/WelcomeState';
-import { UserBubble } from '../components/ChatBubble';
-import { MarkdownText, ChatMode } from '../components/MarkdownText';
-import { InputArea } from '../components/InputArea';
+import Svg, { Circle, Line, Path, Rect, SvgXml } from 'react-native-svg';
 import { ArtifactResults, stripArtifactLinksFromText } from '../components/ArtifactResults';
-import Svg, { Path, Circle, Line, Rect, SvgXml } from 'react-native-svg';
+import { UserBubble } from '../components/ChatBubble';
+import { Header } from '../components/Header';
+import { InputArea } from '../components/InputArea';
+import { ChatMode, MarkdownText } from '../components/MarkdownText';
+import { WelcomeState } from '../components/WelcomeState';
+import { useStableWebSocket } from '../hooks/useStableWebSocket';
 
 const ACTION_DETAIL_MAX_HEIGHT = Math.round(Dimensions.get('window').height / 3);
 const candleStaticSvgXml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -535,7 +536,11 @@ const AiBubble: React.FC<{ msg: Extract<MessageItem, { type: 'ai' }> }> = ({ msg
   const isExpanded = (id: string, defaultVal: boolean) => expanded[id] ?? defaultVal;
   const artifactSources = msg.nodes.flatMap((node) => {
     if (node.type === 'text') return [node.content];
-    if (node.type === 'tool' && node.status === 'done' && node.output) return [node.output];
+    if (node.type === 'tool' && node.status === 'done' && node.output) {
+      // Exclude web search/browse outputs — they contain regular web URLs, not sandbox files
+      if (node.actionName === 'Search' || node.actionName === 'Browse' || node.actionName === 'Browser') return [];
+      return [node.output];
+    }
     return [];
   });
   const liveActionNode = msg.isProcessing
@@ -625,8 +630,8 @@ const toolStyles = StyleSheet.create({
     paddingHorizontal: 2,
   },
   divider: {
-    height: 1,
-    backgroundColor: '#F3F4F6',
+    height: 0.5,
+    backgroundColor: 'rgba(60,60,67,0.08)',
     marginVertical: 12,
     marginHorizontal: 8,
   },
@@ -641,7 +646,7 @@ const toolStyles = StyleSheet.create({
     marginBottom: 8,
   },
   domainIcon: {
-    backgroundColor: '#111827',
+    backgroundColor: '#1C1C1E',
     width: 16,
     height: 16,
     borderRadius: 8,
@@ -652,35 +657,35 @@ const toolStyles = StyleSheet.create({
   searchCardUrl: {
     fontSize: 12,
     fontWeight: '500',
-    color: '#4B5563',
+    color: '#636366',
   },
   searchCardTitle: {
     fontSize: 15,
     fontWeight: '700',
-    color: '#111827',
+    color: '#1C1C1E',
     marginBottom: 6,
     lineHeight: 22,
   },
   searchCardSnippet: {
     fontSize: 13,
-    color: '#6B7280',
+    color: '#636366',
     lineHeight: 20,
   },
   terminalContainer: {
-    backgroundColor: '#000000',
-    borderBottomLeftRadius: 8,
-    borderBottomRightRadius: 8,
+    backgroundColor: '#1C1C1E',
+    borderBottomLeftRadius: 12,
+    borderBottomRightRadius: 12,
     overflow: 'hidden',
   },
   terminalHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#1F2937',
+    backgroundColor: '#2C2C2E',
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
   terminalHeaderText: {
-    color: '#D1D5DB',
+    color: '#AEAEB2',
     fontSize: 12,
     fontWeight: '600',
     marginLeft: 8,
@@ -689,7 +694,7 @@ const toolStyles = StyleSheet.create({
     maxHeight: 250,
   },
   terminalText: {
-    color: '#10B981', // Codex Green
+    color: '#30D158',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     fontSize: 12,
     lineHeight: 18,
@@ -709,7 +714,7 @@ const aiBubbleStyles = StyleSheet.create({
     marginBottom: 10,
   },
   liveStatusText: {
-    color: '#4B5563',
+    color: '#3C3C43',
     fontSize: 13,
     fontWeight: '600',
   },
@@ -720,7 +725,7 @@ const aiBubbleStyles = StyleSheet.create({
     marginBottom: 10,
   },
   doneHeaderText: {
-    color: '#374151',
+    color: '#1C1C1E',
     fontSize: 13,
     fontWeight: '700',
     marginLeft: 8,
@@ -729,36 +734,34 @@ const aiBubbleStyles = StyleSheet.create({
     width: 14,
     height: 3,
     borderRadius: 2,
-    backgroundColor: '#2563EB',
+    backgroundColor: '#007AFF',
     marginLeft: 7,
   },
   actionPane: {
-    borderWidth: 0,
-    borderColor: 'transparent',
-    borderRadius: 0,
-    backgroundColor: 'transparent',
-    paddingHorizontal: 0,
-    paddingVertical: 0,
+    borderRadius: 16,
+    backgroundColor: 'rgba(248,249,252,0.72)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
     marginBottom: 12,
+    borderWidth: 0.5,
+    borderColor: 'rgba(60,60,67,0.08)',
   },
   actionCard: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#F3F4F6',
+    backgroundColor: 'rgba(255,255,255,0.6)',
+    borderRadius: 14,
+    borderWidth: 0.5,
+    borderColor: 'rgba(255,255,255,0.5)',
     paddingVertical: 8,
     paddingHorizontal: 12,
     marginBottom: 12,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.02,
-    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 8,
     elevation: 1,
   },
   actionRowContainer: {
     paddingVertical: 7,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F3F4F6',
   },
   actionHeader: {
     flexDirection: 'row',
@@ -778,11 +781,11 @@ const aiBubbleStyles = StyleSheet.create({
     width: 7,
     height: 7,
     borderRadius: 4,
-    backgroundColor: '#9CA3AF',
+    backgroundColor: '#8E8E93',
     marginTop: 6,
   },
   actionTitle: {
-    color: '#374151',
+    color: '#1C1C1E',
     fontSize: 13,
     fontWeight: '600',
     marginBottom: 2,
@@ -791,7 +794,7 @@ const aiBubbleStyles = StyleSheet.create({
     marginTop: 2,
   },
   previewLine: {
-    color: '#6B7280',
+    color: '#636366',
     fontSize: 12,
     lineHeight: 18,
   },
@@ -801,18 +804,18 @@ const aiBubbleStyles = StyleSheet.create({
     paddingRight: 6,
   },
   reasoningLine: {
-    color: '#4B5563',
+    color: '#3C3C43',
     fontSize: 12,
     lineHeight: 18,
     marginBottom: 4,
   },
   actionContent: {
     marginTop: 4,
-    paddingLeft: 22, // Indent content under the icon
+    paddingLeft: 22,
     opacity: 0.85,
   },
   toolTarget: {
-    color: '#9CA3AF',
+    color: '#8E8E93',
     fontSize: 13,
     flexShrink: 1,
     marginRight: 8,
@@ -857,8 +860,120 @@ function getWebSocketUrl() {
 export default function ChatScreen() {
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const flashListRef = useRef<FlashListRef<MessageItem>>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
+
+  const wsUrl = React.useMemo(() => getWebSocketUrl(), []);
+
+  const handleWsMessage = useCallback((data: any) => {
+    setMessages((prev) => {
+      const msgs = [...prev];
+      const last = msgs[msgs.length - 1];
+
+      // Ensure we are working with an AI message
+      if (!last || last.type !== 'ai') {
+        if (data.type === 'status' && data.content === 'Agent started...') {
+          msgs.push({ id: `ai-${Date.now()}`, type: 'ai', mode: 'normal', nodes: [], isProcessing: true });
+        }
+        return msgs;
+      }
+
+      // We create a fully new object to force React to re-render properly
+      const newAiMsg = { ...last, nodes: [...last.nodes] };
+      msgs[msgs.length - 1] = newAiMsg;
+
+      if (data.type === 'mode') {
+        newAiMsg.mode = data.mode as ChatMode;
+        return msgs;
+      }
+
+      if (data.type === 'reasoning_chunk') {
+        const chunk = String(data.content ?? '');
+        if (!chunk.trim()) return msgs;
+        let rNode = newAiMsg.nodes[newAiMsg.nodes.length - 1]?.type === 'reasoning'
+          ? newAiMsg.nodes[newAiMsg.nodes.length - 1] as Extract<AiStreamNode, { type: 'reasoning' }>
+          : undefined;
+        if (!rNode) {
+          rNode = { type: 'reasoning', id: `r-${Date.now()}`, content: chunk };
+          newAiMsg.nodes.push(rNode);
+        } else {
+          const index = newAiMsg.nodes.indexOf(rNode);
+          newAiMsg.nodes[index] = { ...rNode, content: rNode.content + chunk };
+        }
+        return msgs;
+      }
+
+      if (data.type === 'tool_start') {
+        let actionName = 'Executing';
+        if (data.toolName === 'search_web') actionName = 'Search';
+        else if (data.toolName === 'browse_web') actionName = 'Browse';
+        else if (data.toolName === 'browser_interact') actionName = 'Browser';
+        else if (data.toolName === 'run_python') actionName = 'Python';
+        else if (data.toolName === 'run_terminal') actionName = 'Terminal';
+        else if (data.toolName === 'list_e2b_templates' || data.toolName === 'set_e2b_template') actionName = 'E2B';
+        else if (data.toolName === 'capability_catalog') actionName = 'Toolbox';
+        else if (data.toolName === 'list_sandbox_files' || data.toolName === 'get_sandbox_file_url') actionName = 'File';
+        else if (data.toolName === 'create_artifact') actionName = 'File';
+        else if (data.toolName === 'download_video') actionName = 'Video';
+
+        const targetRaw = getToolTargetName(data.toolName, data.input);
+        const targetName = targetRaw.length > 50 ? targetRaw.slice(0, 50) : targetRaw;
+
+        newAiMsg.nodes.push({ type: 'tool', id: `t-${Date.now()}`, actionName, targetName, status: 'running' });
+        return msgs;
+      }
+
+      if (data.type === 'tool_end') {
+        let tNode = newAiMsg.nodes.findLast(n => n.type === 'tool' && n.status === 'running') as Extract<AiStreamNode, { type: 'tool' }> | undefined;
+        if (tNode) {
+          const index = newAiMsg.nodes.indexOf(tNode);
+          const completedNode = { ...tNode, status: 'done' as const, output: formatToolDisplayOutput(tNode.actionName, data.output) };
+          newAiMsg.nodes[index] = completedNode;
+        }
+        return msgs;
+      }
+
+      if (data.type === 'thought_chunk') {
+        const content = String(data.content ?? '');
+        if (!content || isNoiseAssistantText(content)) return msgs;
+
+        let tNode = newAiMsg.nodes.findLast(n => n.type === 'text');
+        const isLastNodeText = newAiMsg.nodes.length > 0 && newAiMsg.nodes[newAiMsg.nodes.length - 1].type === 'text';
+        
+        if (!isLastNodeText) {
+          tNode = { type: 'text', id: `txt-${Date.now()}`, content: '' };
+          newAiMsg.nodes.push(tNode);
+        }
+
+        const index = newAiMsg.nodes.findIndex(n => n.id === tNode!.id);
+        newAiMsg.nodes[index] = { ...tNode!, content: tNode!.content + content };
+        return msgs;
+      }
+
+      if (data.type === 'status' && data.content === 'Agent finished.') {
+        newAiMsg.isProcessing = false;
+        return msgs;
+      }
+
+      if (data.type === 'error') {
+        newAiMsg.isProcessing = false;
+        const content = sanitizeAssistantText(String(data.content ?? ''));
+        if (content) {
+          newAiMsg.nodes.push({ type: 'text', id: `err-${Date.now()}`, content });
+        }
+        return msgs;
+      }
+
+      return msgs;
+    });
+  }, []);
+
+  const { send, isConnected, state: wsState } = useStableWebSocket({
+    url: wsUrl,
+    onMessage: handleWsMessage,
+    heartbeatInterval: 25_000,
+    heartbeatTimeout: 10_000,
+    initialReconnectDelay: 1000,
+    maxReconnectDelay: 30_000,
+  });
 
   useEffect(() => {
     if (messages.length === 0) return;
@@ -868,130 +983,6 @@ export default function ChatScreen() {
     return () => clearTimeout(timer);
   }, [messages]);
 
-  useEffect(() => {
-    const wsUrl = getWebSocketUrl();
-    console.log('[WS] Connecting to', wsUrl);
-
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      console.log('[WS] Connected');
-      setIsConnected(true);
-    };
-
-    ws.onmessage = (event) => {
-      let data: any;
-      try { data = JSON.parse(event.data); } catch (e) { return; }
-
-      setMessages((prev) => {
-        const msgs = [...prev];
-        const last = msgs[msgs.length - 1];
-
-        // Ensure we are working with an AI message
-        if (!last || last.type !== 'ai') {
-          if (data.type === 'status' && data.content === 'Agent started...') {
-            msgs.push({ id: `ai-${Date.now()}`, type: 'ai', mode: 'normal', nodes: [], isProcessing: true });
-          }
-          return msgs;
-        }
-
-        // We create a fully new object to force React to re-render properly
-        const newAiMsg = { ...last, nodes: [...last.nodes] };
-        msgs[msgs.length - 1] = newAiMsg;
-
-        if (data.type === 'mode') {
-          newAiMsg.mode = data.mode as ChatMode;
-          return msgs;
-        }
-
-        if (data.type === 'reasoning_chunk') {
-          const chunk = String(data.content ?? '');
-          if (!chunk.trim()) return msgs;
-          let rNode = newAiMsg.nodes[newAiMsg.nodes.length - 1]?.type === 'reasoning'
-            ? newAiMsg.nodes[newAiMsg.nodes.length - 1] as Extract<AiStreamNode, { type: 'reasoning' }>
-            : undefined;
-          if (!rNode) {
-            rNode = { type: 'reasoning', id: `r-${Date.now()}`, content: chunk };
-            newAiMsg.nodes.push(rNode);
-          } else {
-            const index = newAiMsg.nodes.indexOf(rNode);
-            newAiMsg.nodes[index] = { ...rNode, content: rNode.content + chunk };
-          }
-          return msgs;
-        }
-
-        if (data.type === 'tool_start') {
-          let actionName = 'Executing';
-          if (data.toolName === 'search_web') actionName = 'Search';
-          else if (data.toolName === 'browse_web') actionName = 'Browse';
-          else if (data.toolName === 'browser_interact') actionName = 'Browser';
-          else if (data.toolName === 'run_python') actionName = 'Python';
-          else if (data.toolName === 'run_terminal') actionName = 'Terminal';
-          else if (data.toolName === 'list_e2b_templates' || data.toolName === 'set_e2b_template') actionName = 'E2B';
-          else if (data.toolName === 'capability_catalog') actionName = 'Toolbox';
-          else if (data.toolName === 'list_sandbox_files' || data.toolName === 'get_sandbox_file_url') actionName = 'File';
-          else if (data.toolName === 'create_artifact') actionName = 'File';
-          else if (data.toolName === 'download_video') actionName = 'Video';
-
-          const targetRaw = getToolTargetName(data.toolName, data.input);
-          const targetName = targetRaw.length > 50 ? targetRaw.slice(0, 50) : targetRaw;
-
-          newAiMsg.nodes.push({ type: 'tool', id: `t-${Date.now()}`, actionName, targetName, status: 'running' });
-          return msgs;
-        }
-
-        if (data.type === 'tool_end') {
-          let tNode = newAiMsg.nodes.findLast(n => n.type === 'tool' && n.status === 'running') as Extract<AiStreamNode, { type: 'tool' }> | undefined;
-          if (tNode) {
-            const index = newAiMsg.nodes.indexOf(tNode);
-            const completedNode = { ...tNode, status: 'done' as const, output: formatToolDisplayOutput(tNode.actionName, data.output) };
-            newAiMsg.nodes[index] = completedNode;
-          }
-          return msgs;
-        }
-
-        if (data.type === 'thought_chunk') {
-          const content = String(data.content ?? '');
-          if (!content || isNoiseAssistantText(content)) return msgs;
-
-          let tNode = newAiMsg.nodes.findLast(n => n.type === 'text');
-          const isLastNodeText = newAiMsg.nodes.length > 0 && newAiMsg.nodes[newAiMsg.nodes.length - 1].type === 'text';
-          
-          if (!isLastNodeText) {
-            tNode = { type: 'text', id: `txt-${Date.now()}`, content: '' };
-            newAiMsg.nodes.push(tNode);
-          }
-
-          const index = newAiMsg.nodes.findIndex(n => n.id === tNode!.id);
-          newAiMsg.nodes[index] = { ...tNode!, content: tNode!.content + content };
-          return msgs;
-        }
-
-        if (data.type === 'status' && data.content === 'Agent finished.') {
-          newAiMsg.isProcessing = false;
-          return msgs;
-        }
-
-        if (data.type === 'error') {
-          newAiMsg.isProcessing = false;
-          const content = sanitizeAssistantText(String(data.content ?? ''));
-          if (content) {
-            newAiMsg.nodes.push({ type: 'text', id: `err-${Date.now()}`, content });
-          }
-          return msgs;
-        }
-
-        return msgs;
-      });
-    };
-
-    ws.onerror = (e) => setIsConnected(false);
-    ws.onclose = ()  => setIsConnected(false);
-
-    return () => ws.close();
-  }, []);
-
   const handleSendPrompt = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -999,13 +990,11 @@ export default function ChatScreen() {
     
     // Smooth scroll to bottom after user sends message
     setTimeout(() => {
-      if (messages.length > 0) flashListRef.current?.scrollToEnd({ animated: true });
+      flashListRef.current?.scrollToEnd({ animated: true });
     }, 100);
 
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'prompt', content: trimmed }));
-    }
-  }, [messages.length]);
+    send({ type: 'prompt', content: trimmed });
+  }, [send]);
 
   const renderItem = useCallback(({ item }: { item: MessageItem }) => {
     if (item.type === 'user') return <UserBubble message={item.content} />;
@@ -1015,7 +1004,6 @@ export default function ChatScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['right', 'left']}>
-      <Header title="Candle" />
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={styles.body}>
           <FlashList
@@ -1024,18 +1012,27 @@ export default function ChatScreen() {
             renderItem={renderItem}
             {...({ estimatedItemSize: 100 } as any)}
             keyExtractor={(item: any) => item.id}
-            ListHeaderComponent={messages.length === 0 ? <WelcomeState /> : <View style={{ height: 16 }} />}
+            ListHeaderComponent={messages.length === 0 ? <WelcomeState /> : <View style={{ height: 24 }} />}
             contentContainerStyle={styles.listContent}
           />
           <View style={styles.inputOverlay} pointerEvents="box-none">
             <LinearGradient
-              colors={['rgba(248,249,250,0)', 'rgba(248,249,250,0.85)', '#F8F9FA']}
-              locations={[0, 0.4, 1]}
+              colors={['rgba(251,251,253,0)', 'rgba(251,251,253,0.92)', '#FBFBFD']}
+              locations={[0, 0.35, 1]}
               style={styles.gradient}
               pointerEvents="none"
             />
             <InputArea onSubmit={handleSendPrompt} />
           </View>
+          {/* Top fade gradient - blurs content under nav */}
+          <LinearGradient
+            colors={['#FBFBFD', 'rgba(251,251,253,0.92)', 'rgba(251,251,253,0)']}
+            locations={[0, 0.6, 1]}
+            style={styles.topGradient}
+            pointerEvents="none"
+          />
+          {/* Floating header overlay - no nav bar, just glass cards */}
+          <Header title="Candle" />
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -1043,10 +1040,11 @@ export default function ChatScreen() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#F8F9FA' },
+  safeArea: { flex: 1, backgroundColor: '#FBFBFD' },
   flex: { flex: 1 },
-  body: { flex: 1, backgroundColor: '#F8F9FA', position: 'relative' },
-  listContent: { paddingBottom: 210 },
+  body: { flex: 1, position: 'relative', backgroundColor: '#FBFBFD' },
+  listContent: { paddingTop: 82, paddingBottom: 210 },
   inputOverlay: { position: 'absolute', bottom: 0, width: '100%' },
   gradient: { position: 'absolute', bottom: 0, width: '100%', height: 210 },
+  topGradient: { position: 'absolute', top: 0, width: '100%', height: 120, zIndex: 40 },
 });

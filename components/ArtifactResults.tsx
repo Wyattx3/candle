@@ -1,22 +1,22 @@
-import React, { memo, useMemo } from 'react';
-import { Image, Linking, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import {
-  Archive,
-  Code2,
-  Database,
-  Download,
-  File,
-  FileAudio,
-  FileImage,
-  FileSpreadsheet,
-  FileText,
-  FileVideo,
-  Globe,
-  Music,
-  Package,
-  Presentation,
+    Archive,
+    Code2,
+    Database,
+    Download,
+    File,
+    FileAudio,
+    FileImage,
+    FileSpreadsheet,
+    FileText,
+    FileVideo,
+    Globe,
+    Music,
+    Package,
+    Presentation,
 } from 'lucide-react-native';
+import React, { memo, useMemo } from 'react';
+import { Image, Linking, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 type ArtifactKind =
   | 'image'
@@ -193,11 +193,12 @@ function isSandboxFileUrl(url: string) {
 }
 
 function getArtifactDefinition(url: string, name?: string): { extension: string; definition: ArtifactDefinition } | undefined {
+  // Only treat URLs from the E2B sandbox as downloadable artifacts
+  if (!isSandboxFileUrl(url)) return undefined;
   const extension = getExtension(name || url);
   const definition = FORMAT_BY_EXTENSION.get(extension);
   if (definition) return { extension, definition };
-  if (isSandboxFileUrl(url)) return { extension: 'file', definition: GENERIC_FORMAT };
-  return undefined;
+  return { extension: extension || 'file', definition: GENERIC_FORMAT };
 }
 
 export function isArtifactUrl(url: string, name?: string) {

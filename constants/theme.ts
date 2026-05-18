@@ -1,41 +1,71 @@
 /**
- * Below are the colors that are used in the app. The colors are defined in the light and dark mode.
- * There are many other ways to style your app. For example, [Nativewind](https://www.nativewind.dev/), [Tamagui](https://tamagui.dev/), [unistyles](https://reactnativeunistyles.vercel.app), etc.
+ * Apple Liquid Glass Design System Colors
+ * Based on Apple's iOS 26 Liquid Glass design language.
+ * Translucent materials, system colors, and depth layering.
  */
 
 import { Platform } from 'react-native';
 
-const tintColorLight = '#0a7ea4';
-const tintColorDark = '#fff';
+const tintColorLight = '#007AFF';
+const tintColorDark = '#0A84FF';
 
 export const Colors = {
   light: {
-    text: '#11181C',
-    background: '#fff',
+    text: '#1C1C1E',
+    secondaryText: '#3C3C43',
+    tertiaryText: '#636366',
+    quaternaryText: '#8E8E93',
+    background: '#F5F5F7',
+    secondaryBackground: '#FFFFFF',
+    tertiaryBackground: 'rgba(255,255,255,0.7)',
     tint: tintColorLight,
-    icon: '#687076',
-    tabIconDefault: '#687076',
+    icon: '#636366',
+    tabIconDefault: '#8E8E93',
     tabIconSelected: tintColorLight,
+    separator: 'rgba(60,60,67,0.08)',
+    glassBg: 'rgba(255,255,255,0.5)',
+    glassBorder: 'rgba(255,255,255,0.4)',
+    glassHighlight: 'rgba(255,255,255,0.7)',
   },
   dark: {
-    text: '#ECEDEE',
-    background: '#151718',
+    text: '#F5F5F7',
+    secondaryText: '#EBEBF5',
+    tertiaryText: '#AEAEB2',
+    quaternaryText: '#636366',
+    background: '#000000',
+    secondaryBackground: '#1C1C1E',
+    tertiaryBackground: 'rgba(44,44,46,0.7)',
     tint: tintColorDark,
-    icon: '#9BA1A6',
-    tabIconDefault: '#9BA1A6',
+    icon: '#AEAEB2',
+    tabIconDefault: '#636366',
     tabIconSelected: tintColorDark,
+    separator: 'rgba(84,84,88,0.36)',
+    glassBg: 'rgba(30,30,30,0.5)',
+    glassBorder: 'rgba(255,255,255,0.1)',
+    glassHighlight: 'rgba(255,255,255,0.12)',
   },
+};
+
+/**
+ * Apple System Colors
+ */
+export const SystemColors = {
+  blue: '#007AFF',
+  green: '#34C759',
+  indigo: '#5856D6',
+  orange: '#FF9500',
+  pink: '#FF2D55',
+  purple: '#AF52DE',
+  red: '#FF3B30',
+  teal: '#5AC8FA',
+  yellow: '#FFCC00',
 };
 
 export const Fonts = Platform.select({
   ios: {
-    /** iOS `UIFontDescriptorSystemDesignDefault` */
     sans: 'system-ui',
-    /** iOS `UIFontDescriptorSystemDesignSerif` */
     serif: 'ui-serif',
-    /** iOS `UIFontDescriptorSystemDesignRounded` */
     rounded: 'ui-rounded',
-    /** iOS `UIFontDescriptorSystemDesignMonospaced` */
     mono: 'ui-monospace',
   },
   default: {

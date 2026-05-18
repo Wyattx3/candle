@@ -263,9 +263,21 @@ export async function retrieveDynamicContext(query: string, limit = 4): Promise<
       return "No task-specific instructions retrieved from Pinecone.";
     }
 
+    // Filter by relevance score — threshold tuned for multilingual (Myanmar+English)
+    // queries where embedding scores tend to be lower for non-English text
+    const RELEVANCE_THRESHOLD = 0.70;
+    const relevantHits = hits.filter((hit: any) => {
+      const score = hit._score ?? hit.score ?? 1;
+      return score >= RELEVANCE_THRESHOLD;
+    });
+
+    if (!relevantHits.length) {
+      return "No sufficiently relevant instructions found for this query.";
+    }
+
     const chunks: string[] = [];
     let usedChars = 0;
-    for (const hit of hits) {
+    for (const hit of relevantHits) {
       const chunk = formatHit(hit.fields as PineconeInstructionFields);
       if (usedChars + chunk.length > MAX_DYNAMIC_CONTEXT_CHARS) break;
       chunks.push(chunk);
