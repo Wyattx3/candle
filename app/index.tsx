@@ -1,9 +1,8 @@
-import type { FlashListRef } from '@shopify/flash-list';
-import { FlashList } from '@shopify/flash-list';
 import Constants from 'expo-constants';
 import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Animated, Dimensions, Easing, KeyboardAvoidingView, LayoutAnimation, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -14,6 +13,15 @@ import { Header } from '../components/Header';
 import { InputArea } from '../components/InputArea';
 import { ChatMode, MarkdownText } from '../components/MarkdownText';
 import { WelcomeState } from '../components/WelcomeState';
+import { LiquidGlass } from '../components/LiquidGlass';
+import {
+  ToolActivityCard,
+  ParallelActivityGroup,
+  SubAgentPanel,
+  VirtualComputerFrame,
+  Favicon,
+  type ActivityNode,
+} from '../components/AgentActivity';
 import { useStableWebSocket } from '../hooks/useStableWebSocket';
 
 const ACTION_DETAIL_MAX_HEIGHT = Math.round(Dimensions.get('window').height / 3);
@@ -65,7 +73,23 @@ const candleStaticTransparentSvgXml = candleStaticSvgXml.replace(
 export type AiStreamNode =
   | { type: 'text'; id: string; content: string }
   | { type: 'reasoning'; id: string; content: string }
-  | { type: 'tool'; id: string; actionName: string; targetName: string; status: 'running' | 'done'; output?: string };
+  | { type: 'tool'; id: string; actionName: string; targetName: string; status: 'running' | 'done'; output?: string; batchId?: number }
+  | {
+      type: 'approval';
+      id: string;
+      requestId: string;
+      command: string;
+      riskLevel: 'low' | 'medium' | 'high';
+      reason?: string;
+      status: 'pending' | 'allow_once' | 'allow_always' | 'reject' | 'auto_reject' | 'expired';
+    }
+  | {
+      type: 'security';
+      id: string;
+      severity: 'medium' | 'high';
+      labels: string[];
+      where: 'prompt' | 'tool';
+    };
 
 export type MessageItem =
   | { id: string; type: 'user'; content: string }
@@ -238,10 +262,7 @@ const WebSearchCollage: React.FC<{ output?: string }> = ({ output }) => {
           <TouchableOpacity style={toolStyles.searchCard} onPress={() => handleOpenLink(r.url)} activeOpacity={0.6}>
             <View style={toolStyles.domainRow}>
               <View style={toolStyles.domainIcon}>
-                <Svg width={10} height={10} viewBox="0 0 24 24" fill="none">
-                  <Circle cx="12" cy="12" r="10" stroke="#4B5563" strokeWidth={2} />
-                  <Path d="M2 12H22M12 2C14.5013 4.73835 15.9228 8.29203 16 12C15.9228 15.708 14.5013 19.2616 12 22C9.49872 19.2616 8.07725 15.708 8 12C8.07725 8.29203 9.49872 4.73835 12 2Z" stroke="#4B5563" strokeWidth={2} />
-                </Svg>
+                <Favicon domain={getDomain(r.url)} size={16} />
               </View>
               <Text style={toolStyles.searchCardUrl} numberOfLines={1}>{getDomain(r.url)}</Text>
             </View>
@@ -365,6 +386,30 @@ function getToolTargetName(toolName: string | undefined, input: unknown): string
   if (toolName === 'create_artifact') return valueToDisplayString(data.filename ?? unwrapped).trim();
   if (toolName === 'capability_catalog') return valueToDisplayString(data.query ?? '100 capabilities').trim();
   if (toolName === 'download_video') return valueToDisplayString(data.url ?? unwrapped).trim();
+  if (toolName === 'sandbox_browser') return valueToDisplayString(data.url ?? data.actions ?? unwrapped).trim();
+  if (toolName === 'spawn_subagent') {
+    const task = valueToDisplayString(data.task ?? unwrapped).replace(/\n/g, ' ').trim();
+    return task.length > 80 ? task.slice(0, 80) + '…' : task;
+  }
+  if (toolName === 'spawn_subagents_parallel') {
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    if (tasks.length === 0) return 'parallel workers';
+    const previews = tasks
+      .slice(0, 3)
+      .map((entry) => {
+        if (entry && typeof entry === 'object') {
+          const item = entry as Record<string, unknown>;
+          const text = valueToDisplayString(item.task ?? item.id ?? '').replace(/\n/g, ' ').trim();
+          return text.length > 40 ? text.slice(0, 40) + '…' : text;
+        }
+        return '';
+      })
+      .filter(Boolean);
+    const more = tasks.length > previews.length ? ` (+${tasks.length - previews.length} more)` : '';
+    return `${tasks.length} workers — ${previews.join(' | ')}${more}`;
+  }
+  if (toolName === 'skill_view') return valueToDisplayString(data.name ?? unwrapped).trim();
+  if (toolName === 'skill_manage') return valueToDisplayString(data.action ?? data.name ?? 'list').trim();
 
   const raw = valueToDisplayString(unwrapped);
   return raw.replace(/\n/g, ' ').trim();
@@ -406,6 +451,9 @@ function getToolActivityLine(node: Extract<AiStreamNode, { type: 'tool' }>): str
     if (node.actionName === 'Toolbox') return `Choosing the right capability${target}`;
     if (node.actionName === 'File') return `Preparing file result${target}`;
     if (node.actionName === 'Video') return `Downloading video${target}`;
+    if (node.actionName === 'Subagent') return `Running subagent${target}`;
+    if (node.actionName === 'Workers') return `Running ${node.targetName ? node.targetName : 'parallel workers'}`;
+    if (node.actionName === 'Skill') return `Loading skill${target}`;
     return `Working${target}`;
   }
 
@@ -418,6 +466,9 @@ function getToolActivityLine(node: Extract<AiStreamNode, { type: 'tool' }>): str
   if (node.actionName === 'Toolbox') return `Capability${target}`;
   if (node.actionName === 'File') return `File${target}`;
   if (node.actionName === 'Video') return `Video${target}`;
+  if (node.actionName === 'Subagent') return `Subagent${target}`;
+  if (node.actionName === 'Workers') return `Parallel workers${target}`;
+  if (node.actionName === 'Skill') return `Skill${target}`;
   return `Tool${target}`;
 }
 
@@ -525,6 +576,112 @@ const ToolRow: React.FC<{
   );
 };
 
+/**
+ * ============================================================================
+ * APPROVAL CARD — Inline command-permission UI
+ * ============================================================================
+ * Rendered inside the same action pane as reasoning/tool rows when the backend
+ * sends an `approval_request`. Tap allow_once / allow_always / reject and the
+ * decision is forwarded over the WebSocket via the ApprovalContext.
+ */
+
+type ApprovalNode = Extract<AiStreamNode, { type: 'approval' }>;
+
+interface ApprovalContextValue {
+  decide: (requestId: string, command: string, decision: 'allow_once' | 'allow_always' | 'reject') => void;
+}
+
+const ApprovalContext = React.createContext<ApprovalContextValue | undefined>(undefined);
+
+const RISK_BADGES: Record<ApprovalNode['riskLevel'], { label: string; color: string; bg: string }> = {
+  low:    { label: 'Low risk',    color: '#0F766E', bg: 'rgba(16,185,129,0.12)' },
+  medium: { label: 'Needs review', color: '#92400E', bg: 'rgba(245,158,11,0.16)' },
+  high:   { label: 'High risk',   color: '#991B1B', bg: 'rgba(239,68,68,0.14)' },
+};
+
+const STATUS_LABEL: Record<ApprovalNode['status'], string> = {
+  pending: 'Awaiting approval',
+  allow_once: 'Allowed once',
+  allow_always: 'Allowed for this session',
+  reject: 'Rejected',
+  auto_reject: 'Auto-rejected (high risk)',
+  expired: 'Timed out — auto-rejected',
+};
+
+const ApprovalCard: React.FC<{ node: ApprovalNode }> = ({ node }) => {
+  const ctx = useContext(ApprovalContext);
+  const badge = RISK_BADGES[node.riskLevel];
+  const isPending = node.status === 'pending';
+
+  return (
+    <LiquidGlass variant="regular" borderRadius={14} style={approvalStyles.containerOuter} contentStyle={approvalStyles.container}>
+      <View style={approvalStyles.headerRow}>
+        <Text style={approvalStyles.title}>Run terminal command?</Text>
+        <View style={[approvalStyles.badge, { backgroundColor: badge.bg }]}>
+          <Text style={[approvalStyles.badgeText, { color: badge.color }]}>{badge.label}</Text>
+        </View>
+      </View>
+      <View style={approvalStyles.commandBox}>
+        <Text style={approvalStyles.commandText} selectable numberOfLines={6}>
+          {node.command}
+        </Text>
+      </View>
+      {node.reason ? <Text style={approvalStyles.reason}>{node.reason}</Text> : null}
+      {isPending ? (
+        <View style={approvalStyles.actionRow}>
+          <TouchableOpacity
+            style={[approvalStyles.btn, approvalStyles.btnReject]}
+            onPress={() => ctx?.decide(node.requestId, node.command, 'reject')}
+            activeOpacity={0.7}
+          >
+            <Text style={approvalStyles.btnRejectText}>Reject</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[approvalStyles.btn, approvalStyles.btnAllow]}
+            onPress={() => ctx?.decide(node.requestId, node.command, 'allow_once')}
+            activeOpacity={0.7}
+          >
+            <Text style={approvalStyles.btnAllowText}>Allow once</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[approvalStyles.btn, approvalStyles.btnAlways]}
+            onPress={() => ctx?.decide(node.requestId, node.command, 'allow_always')}
+            activeOpacity={0.7}
+          >
+            <Text style={approvalStyles.btnAlwaysText}>Allow always</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <Text style={[approvalStyles.statusLine, node.status === 'reject' || node.status.includes('reject') || node.status === 'expired' ? approvalStyles.statusReject : approvalStyles.statusAllow]}>
+          {STATUS_LABEL[node.status]}
+        </Text>
+      )}
+    </LiquidGlass>
+  );
+};
+
+type SecurityNode = Extract<AiStreamNode, { type: 'security' }>;
+
+const SecurityCard: React.FC<{ node: SecurityNode }> = ({ node }) => {
+  const isHigh = node.severity === 'high';
+  const where = node.where === 'prompt' ? 'in your message' : 'in tool output';
+  const labels = node.labels.length > 0 ? node.labels.join(', ') : 'unspecified';
+  return (
+    <View style={[securityStyles.container, isHigh ? securityStyles.high : securityStyles.medium]}>
+      <View style={securityStyles.headerRow}>
+        <Text style={[securityStyles.icon, isHigh ? securityStyles.iconHigh : securityStyles.iconMedium]}>⚠</Text>
+        <Text style={securityStyles.title}>Security notice</Text>
+        <View style={[securityStyles.badge, isHigh ? securityStyles.badgeHigh : securityStyles.badgeMedium]}>
+          <Text style={securityStyles.badgeText}>{node.severity.toUpperCase()}</Text>
+        </View>
+      </View>
+      <Text style={securityStyles.body}>
+        Detected possible prompt-injection patterns {where} ({labels}). The agent will treat the suspicious text as untrusted data and continue.
+      </Text>
+    </View>
+  );
+};
+
 const AiBubble: React.FC<{ msg: Extract<MessageItem, { type: 'ai' }> }> = ({ msg }) => {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
@@ -546,42 +703,110 @@ const AiBubble: React.FC<{ msg: Extract<MessageItem, { type: 'ai' }> }> = ({ msg
   const liveActionNode = msg.isProcessing
     ? [...msg.nodes].reverse().find((node) => node.type === 'reasoning' || (node.type === 'tool' && node.status === 'running'))
     : undefined;
-  const renderActionPane = (nodes: Extract<AiStreamNode, { type: 'reasoning' | 'tool' }>[], key: string) => {
+  const renderActionPane = (nodes: Extract<AiStreamNode, { type: 'reasoning' | 'tool' | 'approval' | 'security' }>[], key: string) => {
     const visibleNodes = nodes.filter((node) => (
-      node.type === 'tool' || node.content.trim().length > 0
+      node.type === 'tool' || node.type === 'approval' || node.type === 'security' || node.content.trim().length > 0
     ));
     if (visibleNodes.length === 0) return null;
+
+    const COMPUTER_ACTIONS = new Set(['Browse', 'Browser', 'Python', 'Terminal', 'Video']);
+    const toActivity = (n: Extract<AiStreamNode, { type: 'tool' }>): ActivityNode => ({
+      id: n.id, actionName: n.actionName, targetName: n.targetName, status: n.status, output: n.output,
+    });
+
+    // Render the buffered tool nodes as a single visual unit, choosing the
+    // right surface: subagent panel, parallel group, virtual-computer frame,
+    // or a plain activity card.
+    const renderToolCluster = (toolNodes: Extract<AiStreamNode, { type: 'tool' }>[], clusterKey: string) => {
+      if (toolNodes.length === 0) return null;
+
+      // Subagent / parallel-workers always get the dedicated panel.
+      const subAgent = toolNodes.find((n) => n.actionName === 'Subagent' || n.actionName === 'Workers');
+      if (subAgent && toolNodes.length === 1) {
+        return <SubAgentPanel key={clusterKey} node={toActivity(subAgent)} />;
+      }
+
+      // 2+ tools buffered together → they ran in parallel.
+      if (toolNodes.length >= 2) {
+        return <ParallelActivityGroup key={clusterKey} nodes={toolNodes.map(toActivity)} />;
+      }
+
+      // Single tool. Computer-type work shows in the virtual computer frame;
+      // everything else uses a clean activity card.
+      const only = toolNodes[0];
+      if (COMPUTER_ACTIONS.has(only.actionName)) {
+        return <VirtualComputerFrame key={clusterKey} node={toActivity(only)} />;
+      }
+      return (
+        <ToolActivityCard
+          key={clusterKey}
+          node={toActivity(only)}
+          expanded={isExpanded(only.id, false)}
+          onToggle={() => toggle(only.id)}
+          renderDetail={(n) => (
+            n.actionName === 'Search'
+              ? <WebSearchCollage output={n.output} />
+              : <MarkdownText content={stripArtifactLinksFromText(n.output || '')} mode="reasoning" />
+          )}
+        />
+      );
+    };
+
+    // Walk the pane, batching consecutive tool nodes into clusters while
+    // keeping reasoning / approval / security inline in order. Tools are only
+    // grouped as "parallel" when they share a batchId (started while another
+    // was still running) — sequential tools render as separate units.
+    const out: React.ReactNode[] = [];
+    let toolBatch: Extract<AiStreamNode, { type: 'tool' }>[] = [];
+    let batchIdx = 0;
+    const flush = () => {
+      if (toolBatch.length > 0) {
+        out.push(renderToolCluster(toolBatch, `${key}-tools-${batchIdx++}`));
+        toolBatch = [];
+      }
+    };
+
+    for (const node of visibleNodes) {
+      if (node.type === 'tool') {
+        // If this tool belongs to a different batch than what's buffered,
+        // flush the current batch first so the two don't merge.
+        const prev = toolBatch[toolBatch.length - 1];
+        if (prev && prev.batchId !== node.batchId) flush();
+        toolBatch.push(node);
+        continue;
+      }
+      flush();
+      if (node.type === 'reasoning') {
+        out.push(
+          <ReasoningRow
+            key={node.id}
+            node={node}
+            expanded={isExpanded(node.id, false)}
+            isLive={liveActionNode?.id === node.id}
+            onToggle={() => toggle(node.id)}
+          />
+        );
+      } else if (node.type === 'security') {
+        out.push(<SecurityCard key={node.id} node={node} />);
+      } else {
+        out.push(<ApprovalCard key={node.id} node={node} />);
+      }
+    }
+    flush();
+
     return (
-      <View key={key} style={aiBubbleStyles.actionPane}>
-        {visibleNodes.map((node) => (
-          node.type === 'reasoning' ? (
-            <ReasoningRow
-              key={node.id}
-              node={node}
-              expanded={isExpanded(node.id, false)}
-              isLive={liveActionNode?.id === node.id}
-              onToggle={() => toggle(node.id)}
-            />
-          ) : (
-            <ToolRow
-              key={node.id}
-              node={node}
-              expanded={isExpanded(node.id, false)}
-              isLive={liveActionNode?.id === node.id}
-              onToggle={() => toggle(node.id)}
-            />
-          )
-        ))}
-      </View>
+      <LiquidGlass key={key} variant="thin" borderRadius={16} style={aiBubbleStyles.actionPane} contentStyle={aiBubbleStyles.actionPaneContent}>
+        {out}
+      </LiquidGlass>
     );
   };
 
   const renderedNodes: React.ReactNode[] = [];
-  let actionBuffer: Extract<AiStreamNode, { type: 'reasoning' | 'tool' }>[] = [];
+  let actionBuffer: Extract<AiStreamNode, { type: 'reasoning' | 'tool' | 'approval' | 'security' }>[] = [];
   let paneIndex = 0;
 
   msg.nodes.forEach((node) => {
-    if (node.type === 'reasoning' || node.type === 'tool') {
+    if (node.type === 'reasoning' || node.type === 'tool' || node.type === 'approval' || node.type === 'security') {
       actionBuffer.push(node);
       return;
     }
@@ -646,13 +871,14 @@ const toolStyles = StyleSheet.create({
     marginBottom: 8,
   },
   domainIcon: {
-    backgroundColor: '#1C1C1E',
-    width: 16,
-    height: 16,
-    borderRadius: 8,
+    backgroundColor: '#F2F3F5',
+    width: 20,
+    height: 20,
+    borderRadius: 6,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 6,
+    marginRight: 8,
+    overflow: 'hidden',
   },
   searchCardUrl: {
     fontSize: 12,
@@ -738,13 +964,11 @@ const aiBubbleStyles = StyleSheet.create({
     marginLeft: 7,
   },
   actionPane: {
-    borderRadius: 16,
-    backgroundColor: 'rgba(248,249,252,0.72)',
+    marginBottom: 12,
+  },
+  actionPaneContent: {
     paddingHorizontal: 12,
     paddingVertical: 6,
-    marginBottom: 12,
-    borderWidth: 0.5,
-    borderColor: 'rgba(60,60,67,0.08)',
   },
   actionCard: {
     backgroundColor: 'rgba(255,255,255,0.6)',
@@ -858,8 +1082,20 @@ function getWebSocketUrl() {
 }
 
 export default function ChatScreen() {
+  const router = useRouter();
   const [messages, setMessages] = useState<MessageItem[]>([]);
-  const flashListRef = useRef<FlashListRef<MessageItem>>(null);
+  // Chat uses a plain ScrollView, not FlashList. The conversation is capped
+  // (trimChatHistory) and messages STREAM + grow continuously, which makes
+  // FlashList v2's recycling mis-measure tall items and overlap them. A
+  // ScrollView renders every row at its true height — no recycling, no
+  // overlap — which is the right tradeoff for a bounded, streaming transcript.
+  const scrollRef = useRef<ScrollView>(null);
+  // Mirror of `messages` so we can read the latest conversation synchronously
+  // when sending a prompt (state updates are async). The history we send is
+  // the source of truth for the backend — it survives reconnects and run
+  // cancellations, both of which previously wiped the server-side history.
+  const messagesRef = useRef<MessageItem[]>([]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
   const wsUrl = React.useMemo(() => getWebSocketUrl(), []);
 
@@ -901,6 +1137,64 @@ export default function ChatScreen() {
         return msgs;
       }
 
+      if (data.type === 'approval_request') {
+        const requestId = String(data.requestId ?? '');
+        if (!requestId) return msgs;
+        // Skip duplicates if the server retransmits.
+        if (newAiMsg.nodes.some(n => n.type === 'approval' && n.requestId === requestId)) {
+          return msgs;
+        }
+        newAiMsg.nodes.push({
+          type: 'approval',
+          id: `appr-${requestId}`,
+          requestId,
+          command: String(data.command ?? ''),
+          riskLevel: (data.riskLevel === 'high' || data.riskLevel === 'low') ? data.riskLevel : 'medium',
+          reason: data.reason ? String(data.reason) : undefined,
+          status: 'pending',
+        });
+        return msgs;
+      }
+
+      if (data.type === 'security_notice') {
+        const severity: SecurityNode['severity'] = data.severity === 'high' ? 'high' : 'medium';
+        const where: SecurityNode['where'] = data.where === 'tool' ? 'tool' : 'prompt';
+        const labels = Array.isArray(data.labels) ? data.labels.map((l: any) => String(l)).slice(0, 8) : [];
+        // Suppress duplicates — same severity + same labels in a row.
+        const last = newAiMsg.nodes[newAiMsg.nodes.length - 1];
+        if (last && last.type === 'security' && last.severity === severity && last.labels.join('|') === labels.join('|')) {
+          return msgs;
+        }
+        newAiMsg.nodes.push({
+          type: 'security',
+          id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          severity,
+          labels,
+          where,
+        });
+        return msgs;
+      }
+
+      if (data.type === 'approval_decision') {
+        // Server-side resolution (timeout, cache hit, auto-reject). Reflect it
+        // in any pending card so the UI stops showing buttons.
+        const command = String(data.command ?? '');
+        const source = String(data.source ?? '');
+        const decision = String(data.decision ?? '');
+        const targetIndex = newAiMsg.nodes.findIndex(n =>
+          n.type === 'approval' && n.status === 'pending' && n.command === command
+        );
+        if (targetIndex >= 0) {
+          const node = newAiMsg.nodes[targetIndex] as Extract<AiStreamNode, { type: 'approval' }>;
+          let nextStatus: Extract<AiStreamNode, { type: 'approval' }>['status'] = 'reject';
+          if (decision === 'allow_once' || decision === 'allow_always') nextStatus = decision;
+          else if (source === 'auto') nextStatus = 'auto_reject';
+          else if (source === 'timeout') nextStatus = 'expired';
+          newAiMsg.nodes[targetIndex] = { ...node, status: nextStatus };
+        }
+        return msgs;
+      }
+
       if (data.type === 'tool_start') {
         let actionName = 'Executing';
         if (data.toolName === 'search_web') actionName = 'Search';
@@ -913,11 +1207,28 @@ export default function ChatScreen() {
         else if (data.toolName === 'list_sandbox_files' || data.toolName === 'get_sandbox_file_url') actionName = 'File';
         else if (data.toolName === 'create_artifact') actionName = 'File';
         else if (data.toolName === 'download_video') actionName = 'Video';
+        else if (data.toolName === 'sandbox_browser') actionName = 'Browser';
+        else if (data.toolName === 'spawn_subagent') actionName = 'Subagent';
+        else if (data.toolName === 'spawn_subagents_parallel') actionName = 'Workers';
+        else if (data.toolName === 'skill_view' || data.toolName === 'skill_manage') actionName = 'Skill';
 
         const targetRaw = getToolTargetName(data.toolName, data.input);
         const targetName = targetRaw.length > 50 ? targetRaw.slice(0, 50) : targetRaw;
 
-        newAiMsg.nodes.push({ type: 'tool', id: `t-${Date.now()}`, actionName, targetName, status: 'running' });
+        // Mark tools that start while another is still running as the SAME
+        // parallel batch — this is what lets the UI group genuinely
+        // concurrent calls (and NOT merge sequential ones). A fresh batch id
+        // is minted whenever no tool is currently running.
+        const hasRunningTool = newAiMsg.nodes.some(n => n.type === 'tool' && n.status === 'running');
+        let batchId: number;
+        if (hasRunningTool) {
+          const running = newAiMsg.nodes.filter(n => n.type === 'tool' && n.status === 'running') as Extract<AiStreamNode, { type: 'tool' }>[];
+          batchId = running[running.length - 1]?.batchId ?? Date.now();
+        } else {
+          batchId = Date.now();
+        }
+
+        newAiMsg.nodes.push({ type: 'tool', id: `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, actionName, targetName, status: 'running', batchId });
         return msgs;
       }
 
@@ -953,6 +1264,13 @@ export default function ChatScreen() {
         return msgs;
       }
 
+      if (data.type === 'answer_reset') {
+        // Critic-driven revision: the server is replacing the previous final
+        // answer. Drop any existing text nodes so only the revision shows.
+        newAiMsg.nodes = newAiMsg.nodes.filter((n) => n.type !== 'text');
+        return msgs;
+      }
+
       if (data.type === 'error') {
         newAiMsg.isProcessing = false;
         const content = sanitizeAssistantText(String(data.content ?? ''));
@@ -978,7 +1296,7 @@ export default function ChatScreen() {
   useEffect(() => {
     if (messages.length === 0) return;
     const timer = setTimeout(() => {
-      flashListRef.current?.scrollToEnd({ animated: true });
+      scrollRef.current?.scrollToEnd({ animated: true });
     }, 60);
     return () => clearTimeout(timer);
   }, [messages]);
@@ -986,14 +1304,43 @@ export default function ChatScreen() {
   const handleSendPrompt = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
-    setMessages(prev => [...prev, { id: `user-${Date.now()}`, type: 'user', content: trimmed }]);
+
+    // Build the conversation history from what's already on screen. This is
+    // the source of truth the backend uses — sending it with every prompt
+    // makes the agent robust to (a) a run being cancelled mid-flight by the
+    // next prompt and (b) WebSocket reconnects, both of which used to wipe
+    // the server's in-memory history and leave the agent with no context.
+    const history = messagesRef.current
+      .map((m) => {
+        if (m.type === 'user') {
+          return { role: 'user' as const, content: m.content };
+        }
+        // Concatenate the AI message's visible text nodes into one turn.
+        const textContent = m.nodes
+          .filter((n) => n.type === 'text')
+          .map((n) => (n as Extract<AiStreamNode, { type: 'text' }>).content)
+          .join('')
+          .trim();
+        return textContent ? { role: 'assistant' as const, content: textContent } : null;
+      })
+      .filter((m): m is { role: 'user' | 'assistant'; content: string } => m != null);
+
+    setMessages(prev => [
+      ...prev,
+      { id: `user-${Date.now()}`, type: 'user', content: trimmed },
+      // Create the AI placeholder IMMEDIATELY so the "thinking" indicator
+      // shows the instant the user sends — no waiting on the server's
+      // "Agent started" round-trip. The WS handler reuses this trailing AI
+      // bubble for all subsequent events.
+      { id: `ai-${Date.now() + 1}`, type: 'ai', mode: 'normal', nodes: [], isProcessing: true },
+    ]);
     
     // Smooth scroll to bottom after user sends message
     setTimeout(() => {
-      flashListRef.current?.scrollToEnd({ animated: true });
+      scrollRef.current?.scrollToEnd({ animated: true });
     }, 100);
 
-    send({ type: 'prompt', content: trimmed });
+    send({ type: 'prompt', content: trimmed, history });
   }, [send]);
 
   const renderItem = useCallback(({ item }: { item: MessageItem }) => {
@@ -1002,19 +1349,43 @@ export default function ChatScreen() {
     return null;
   }, []);
 
+  const handleApprovalDecide = useCallback<ApprovalContextValue['decide']>((requestId, command, decision) => {
+    // Optimistic UI: mark the card resolved immediately so the user gets
+    // instant feedback. The backend's `approval_decision` event would
+    // overwrite this if the IDs lined up, but we match by command text too.
+    setMessages((prev) => prev.map((message) => {
+      if (message.type !== 'ai') return message;
+      let mutated = false;
+      const nextNodes = message.nodes.map((node) => {
+        if (node.type === 'approval' && node.requestId === requestId && node.status === 'pending') {
+          mutated = true;
+          return { ...node, status: decision };
+        }
+        return node;
+      });
+      return mutated ? { ...message, nodes: nextNodes } : message;
+    }));
+    send({ type: 'approval_response', requestId, decision });
+  }, [send]);
+
   return (
+    <ApprovalContext.Provider value={{ decide: handleApprovalDecide }}>
     <SafeAreaView style={styles.safeArea} edges={['right', 'left']}>
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={styles.body}>
-          <FlashList
-            ref={flashListRef}
-            data={messages}
-            renderItem={renderItem}
-            {...({ estimatedItemSize: 100 } as any)}
-            keyExtractor={(item: any) => item.id}
-            ListHeaderComponent={messages.length === 0 ? <WelcomeState /> : <View style={{ height: 24 }} />}
+          <ScrollView
+            ref={scrollRef}
+            style={styles.flex}
+            keyboardShouldPersistTaps="handled"
             contentContainerStyle={styles.listContent}
-          />
+            onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+            showsVerticalScrollIndicator={false}
+          >
+            {messages.length === 0 ? <WelcomeState /> : <View style={{ height: 24 }} />}
+            {messages.map((item) => (
+              <View key={item.id}>{renderItem({ item })}</View>
+            ))}
+          </ScrollView>
           <View style={styles.inputOverlay} pointerEvents="box-none">
             <LinearGradient
               colors={['rgba(251,251,253,0)', 'rgba(251,251,253,0.92)', '#FBFBFD']}
@@ -1032,19 +1403,120 @@ export default function ChatScreen() {
             pointerEvents="none"
           />
           {/* Floating header overlay - no nav bar, just glass cards */}
-          <Header title="Candle" />
+          <Header title="Candle" onSkillsPress={() => router.push('/skill-suggestions')} />
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
+    </ApprovalContext.Provider>
   );
 }
+
+const approvalStyles = StyleSheet.create({
+  containerOuter: {
+    marginVertical: 6,
+  },
+  container: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  title: { fontSize: 14, fontWeight: '700', color: '#1C1C1E', flexShrink: 1, marginRight: 8 },
+  badge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999 },
+  badgeText: { fontSize: 11, fontWeight: '700' },
+  commandBox: {
+    backgroundColor: 'rgba(244,244,246,0.7)',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.6)',
+  },
+  commandText: {
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 12.5,
+    lineHeight: 18,
+    color: '#1C1C1E',
+  },
+  reason: { marginTop: 8, fontSize: 12.5, color: '#6B7280' },
+  actionRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+    gap: 8,
+  },
+  btn: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  btnReject: { backgroundColor: '#FFFFFF', borderColor: 'rgba(239,68,68,0.5)' },
+  btnAllow: { backgroundColor: '#1C1C1E', borderColor: '#1C1C1E' },
+  btnAlways: { backgroundColor: '#FFFFFF', borderColor: 'rgba(60,60,67,0.25)' },
+  btnRejectText: { color: '#B91C1C', fontWeight: '700', fontSize: 13 },
+  btnAllowText: { color: '#FFFFFF', fontWeight: '700', fontSize: 13 },
+  btnAlwaysText: { color: '#1C1C1E', fontWeight: '600', fontSize: 13 },
+  statusLine: { marginTop: 10, fontSize: 12, fontWeight: '600' },
+  statusAllow: { color: '#0F766E' },
+  statusReject: { color: '#B91C1C' },
+});
+
+const securityStyles = StyleSheet.create({
+  container: {
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    marginVertical: 6,
+  },
+  high: {
+    backgroundColor: 'rgba(254, 226, 226, 0.6)',
+    borderColor: 'rgba(220, 38, 38, 0.35)',
+  },
+  medium: {
+    backgroundColor: 'rgba(254, 243, 199, 0.6)',
+    borderColor: 'rgba(217, 119, 6, 0.35)',
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 6,
+  },
+  icon: { fontSize: 16, fontWeight: '700' },
+  iconHigh: { color: '#B91C1C' },
+  iconMedium: { color: '#B45309' },
+  title: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1C1C1E',
+  },
+  badge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  badgeHigh: { backgroundColor: '#B91C1C' },
+  badgeMedium: { backgroundColor: '#B45309' },
+  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '700', letterSpacing: 0.4 },
+  body: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#3F3F46',
+  },
+});
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#FBFBFD' },
   flex: { flex: 1 },
   body: { flex: 1, position: 'relative', backgroundColor: '#FBFBFD' },
   listContent: { paddingTop: 82, paddingBottom: 210 },
-  inputOverlay: { position: 'absolute', bottom: 0, width: '100%' },
-  gradient: { position: 'absolute', bottom: 0, width: '100%', height: 210 },
+  inputOverlay: { position: 'absolute', bottom: 0, width: '100%' },  gradient: { position: 'absolute', bottom: 0, width: '100%', height: 210 },
   topGradient: { position: 'absolute', top: 0, width: '100%', height: 120, zIndex: 40 },
 });

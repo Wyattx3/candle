@@ -8,10 +8,17 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "generate:prompts": "node scripts/generate-prompt-bank.js",
+    "skills:mine": "node scripts/mine-skills.js",
+    "smoke:e2e": "ts-node scripts/smoke-e2e.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "e2b:template:create": "node scripts/create-e2b-template.js",
     "e2b:template:create:cli": "powershell -ExecutionPolicy Bypass -File scripts/create-e2b-template.ps1",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [],
   "author": "",
@@ -19,16 +26,23 @@
   "type": "commonjs",
   "devDependencies": {
     "@e2b/cli": "^2.10.1",
+    "@eslint/js": "^9.39.4",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
     "@types/ws": "^8.18.1",
+    "@vitest/ui": "^2.1.9",
+    "eslint": "^9.39.4",
+    "globals": "^15.15.0",
     "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.60.0",
+    "vitest": "^2.1.9"
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",
     "@langchain/langgraph": "^1.3.0",
+    "@langchain/mcp-adapters": "^1.1.3",
     "@langchain/openai": "^1.4.5",
     "@onkernel/sdk": "^0.52.0",
     "@pinecone-database/pinecone": "^7.2.0",

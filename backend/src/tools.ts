@@ -3,13 +3,42 @@ import Kernel from "@onkernel/sdk";
 import * as cheerio from "cheerio";
 import { Sandbox as E2BSandbox } from "e2b";
 import { z } from "zod";
+import { getSessionId } from "./agent/session";
+import { classifyCommandRisk, getApprovalGate } from "./approvals";
+import { getReadBlockError, getWriteBlockError } from "./agent/file-safety";
 
-// We'll manage a singleton E2B sandbox for the duration of the agent run
+/**
+ * Per-session E2B sandbox registry.
+ *
+ * Each WebSocket connection gets its own session id (via
+ * `withSessionContext({ sessionId: connectionId })` in `server.ts`). The map
+ * below keys a `SandboxRecord` per session so concurrent users do not share
+ * `/home/user/`. Scripts and tests that run outside any session context land
+ * on `"_default"`, which preserves the legacy single-sandbox behaviour.
+ *
+ * The legacy `sandbox` export below remains as a `null` shim so any caller
+ * that imported the global pointer keeps compiling. New code should call
+ * `getSandboxForSession()` or rely on `runWithSandboxRetry`.
+ */
+interface SandboxRecord {
+  sandbox: any;
+  templateId: string;
+  /** Per-session lock chain to serialise sandbox mutations. */
+  lock: Promise<void>;
+}
+
+const sandboxes = new Map<string, SandboxRecord>();
+
+// Legacy compatibility shim — `null` means "no global sandbox; use the
+// session-keyed registry". Existing imports keep working. Kept as `let`
+// (instead of `const`) for backwards-binary-compat with older builds that
+// might import a mutable reference.
+// eslint-disable-next-line prefer-const, @typescript-eslint/no-explicit-any
 export let sandbox: any = null;
 let currentTemplate = "";
-let defaultE2BTemplate = process.env.E2B_TEMPLATE_ID || process.env.E2B_TEMPLATE_NAME || "lxq0wfatmw3i42mooiea";
+// eslint-disable-next-line prefer-const
+export let defaultE2BTemplate = process.env.E2B_TEMPLATE_ID || process.env.E2B_TEMPLATE_NAME || "lxq0wfatmw3i42mooiea";
 const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS) || 900_000;
-let sandboxLock: Promise<void> = Promise.resolve();
 
 const E2B_TEMPLATES = [
   { id: "lxq0wfatmw3i42mooiea", name: "candle-autonomous-agent", cpu: 4, memory: "4GB", useFor: "default Candle autonomous agent template with Python, Node.js, media, docs, data, browser-support, and CLI utilities preinstalled" },
@@ -28,7 +57,25 @@ function resolveTemplateId(template?: string) {
   return E2B_TEMPLATES.find((item) => item.id === requested || item.name === requested)?.id || requested;
 }
 
-function selectTemplateForTask(_kind: string, _signal: string, requestedTemplate?: string) {
+/**
+ * Template selection precedence:
+ *   1. Explicit `requestedTemplate` on the tool call (model asked for it).
+ *   2. A session-pinned template set via `set_e2b_template` (currentTemplate).
+ *   3. The default `candle-autonomous-agent` template.
+ *
+ * IMPORTANT — why there is no per-task auto-heuristic: only the default
+ * `candle-autonomous-agent` template (built from `e2b.Dockerfile`) ships
+ * Candle's full toolchain — Playwright + Chromium + the persistent browser
+ * profile, ffmpeg, tesseract, pandoc, poppler, etc. The other 8 templates in
+ * `E2B_TEMPLATES` are generic coding-agent images imported from the user's
+ * dashboard and do NOT have that toolchain. Auto-routing `sandbox_browser`,
+ * `download_video`, or `screenshot_analyze` to them would break those tools
+ * (missing Playwright/ffmpeg/tesseract). So auto-selection always stays on the
+ * fully-equipped default; the specialised templates are reachable only when
+ * the agent EXPLICITLY chooses one via `set_e2b_template` / `template_id`
+ * (e.g. for a pure coding task in the `codex` or `claude` environment).
+ */
+export function selectTemplateForTask(toolName: string, param: string = "", requestedTemplate?: string): string {
   return resolveTemplateId(requestedTemplate || currentTemplate || defaultE2BTemplate);
 }
 
@@ -40,14 +87,28 @@ function selectTemplateForCurrentSandbox(kind: string, signal: string, requested
   return selectTemplateForTask(kind, signal, requestedTemplate);
 }
 
-async function withSandboxLock<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = sandboxLock;
+/**
+ * Run `operation` while holding the per-session sandbox lock. The map's
+ * record always uses the most recent lock promise — this keeps concurrent
+ * tool calls within the SAME session serialised on the sandbox while
+ * letting different sessions proceed in parallel.
+ */
+async function withSessionLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+  const existing = sandboxes.get(sessionId);
+  const previousLock = existing?.lock ?? Promise.resolve();
+
   let release!: () => void;
-  sandboxLock = new Promise<void>((resolve) => {
+  const nextLock = new Promise<void>((resolve) => {
     release = resolve;
   });
 
-  await previous;
+  if (existing) {
+    existing.lock = nextLock;
+  } else {
+    sandboxes.set(sessionId, { sandbox: null, templateId: "", lock: nextLock });
+  }
+
+  await previousLock;
   try {
     return await operation();
   } finally {
@@ -55,54 +116,82 @@ async function withSandboxLock<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-const initSandboxUnlocked = async (templateId: string = defaultE2BTemplate) => {
-  const resolvedTemplateId = resolveTemplateId(templateId);
-  if (sandbox && currentTemplate !== resolvedTemplateId) {
-    await closeSandboxUnlocked();
-    sandbox = null;
-  }
-  if (!sandbox) {
-    sandbox = await E2BSandbox.create(resolvedTemplateId, { timeoutMs: SANDBOX_TIMEOUT_MS });
-    currentTemplate = resolvedTemplateId;
-  }
-  return sandbox;
-};
+async function initSandboxForSessionUnlocked(sessionId: string, templateId: string): Promise<any> {
+  const resolved = resolveTemplateId(templateId);
+  const record = sandboxes.get(sessionId);
 
-const closeSandboxUnlocked = async () => {
-  if (sandbox) {
-    if (typeof sandbox.kill === "function") {
-      await sandbox.kill();
+  if (record?.sandbox && record.templateId !== resolved) {
+    await closeSandboxForSessionUnlocked(sessionId);
+  }
+
+  const refreshed = sandboxes.get(sessionId);
+  if (!refreshed?.sandbox) {
+    const created = await E2BSandbox.create(resolved, { timeoutMs: SANDBOX_TIMEOUT_MS });
+    sandboxes.set(sessionId, {
+      sandbox: created,
+      templateId: resolved,
+      lock: refreshed?.lock ?? Promise.resolve(),
+    });
+    // Keep the legacy `currentTemplate` somewhat in sync so
+    // `selectTemplateForTask()` callers without a session see a useful value.
+    currentTemplate = resolved;
+    return created;
+  }
+  return refreshed.sandbox;
+}
+
+async function closeSandboxForSessionUnlocked(sessionId: string): Promise<void> {
+  const record = sandboxes.get(sessionId);
+  if (!record?.sandbox) return;
+  try {
+    if (typeof record.sandbox.kill === "function") {
+      await record.sandbox.kill();
     }
-    sandbox = null;
-    currentTemplate = "";
+  } catch (err: any) {
+    console.warn(`[sandbox:${sessionId}] kill failed: ${err?.message ?? err}`);
   }
+  sandboxes.set(sessionId, { sandbox: null, templateId: "", lock: record.lock });
+}
+
+/** Init the active session's sandbox — used by tools and the /session/start route. */
+export const initSandbox = async (templateId: string = defaultE2BTemplate) => {
+  const sessionId = getSessionId();
+  return withSessionLock(sessionId, () => initSandboxForSessionUnlocked(sessionId, templateId));
 };
 
-export const initSandbox = async (templateId: string = defaultE2BTemplate) =>
-  withSandboxLock(() => initSandboxUnlocked(templateId));
+/** Close the active session's sandbox. */
+export const closeSandbox = async () => {
+  const sessionId = getSessionId();
+  return withSessionLock(sessionId, () => closeSandboxForSessionUnlocked(sessionId));
+};
 
-export const closeSandbox = async () =>
-  withSandboxLock(() => closeSandboxUnlocked());
+/** Lookup helper for callers that hold an explicit session id. */
+export async function getSandboxForSession(sessionId: string, templateId: string = defaultE2BTemplate): Promise<any> {
+  return withSessionLock(sessionId, () => initSandboxForSessionUnlocked(sessionId, templateId));
+}
 
-async function getLiveSandboxUnlocked(templateId: string = defaultE2BTemplate) {
-  if (!sandbox || currentTemplate !== templateId) {
-    return initSandboxUnlocked(resolveTemplateId(templateId));
+async function getLiveSandboxUnlocked(sessionId: string, templateId: string): Promise<any> {
+  const resolved = resolveTemplateId(templateId);
+  const record = sandboxes.get(sessionId);
+
+  if (!record?.sandbox || record.templateId !== resolved) {
+    return initSandboxForSessionUnlocked(sessionId, resolved);
   }
 
-  if (typeof sandbox.isRunning === "function") {
+  if (typeof record.sandbox.isRunning === "function") {
     try {
-      const running = await sandbox.isRunning({ requestTimeoutMs: 10_000 });
+      const running = await record.sandbox.isRunning({ requestTimeoutMs: 10_000 });
       if (!running) {
-        await closeSandboxUnlocked();
-        return initSandboxUnlocked(resolveTemplateId(templateId));
+        await closeSandboxForSessionUnlocked(sessionId);
+        return initSandboxForSessionUnlocked(sessionId, resolved);
       }
     } catch {
-      await closeSandboxUnlocked();
-      return initSandboxUnlocked(resolveTemplateId(templateId));
+      await closeSandboxForSessionUnlocked(sessionId);
+      return initSandboxForSessionUnlocked(sessionId, resolved);
     }
   }
 
-  return sandbox;
+  return record.sandbox;
 }
 
 function isStaleSandboxError(error: any) {
@@ -117,19 +206,41 @@ function isStaleSandboxError(error: any) {
     || error?.name === "TimeoutError";
 }
 
-async function runWithSandboxRetry<T>(
+export async function runWithSandboxRetry<T>(
   templateId: string,
   operation: (liveSandbox: any) => Promise<T>
 ) {
-  return withSandboxLock(async () => {
+  const sessionId = getSessionId();
+  return withSessionLock(sessionId, async () => {
     try {
-      return await operation(await getLiveSandboxUnlocked(templateId));
+      return await operation(await getLiveSandboxUnlocked(sessionId, templateId));
     } catch (error) {
       if (!isStaleSandboxError(error)) throw error;
-      await closeSandboxUnlocked();
-      return operation(await initSandboxUnlocked(templateId));
+      await closeSandboxForSessionUnlocked(sessionId);
+      return operation(await initSandboxForSessionUnlocked(sessionId, templateId));
     }
   });
+}
+
+/**
+ * Approval gate helper used by tools that touch the host or filesystem.
+ * Returns a tool-style error string when the user (or the auto-classifier)
+ * rejects the action, otherwise resolves to `null`. Tools should `return`
+ * this value verbatim when non-null.
+ *
+ * If no gate is in scope (CLI scripts, tests), the call is allowed silently
+ * — the gate is per-WebSocket-connection, not per-tool-implementation.
+ */
+async function ensureApproval(command: string, reason?: string): Promise<string | null> {
+  const gate = getApprovalGate();
+  if (!gate) return null;
+  const riskLevel = classifyCommandRisk(command);
+  if (riskLevel === "low") return null;
+  const decision = await gate({ command, riskLevel, reason });
+  if (decision === "reject") {
+    return `Refused: the user did not approve this ${riskLevel}-risk command. Try a safer alternative or stop and ask.`;
+  }
+  return null;
 }
 
 const TEMPLATE_DESCRIPTIONS =
@@ -137,6 +248,30 @@ const TEMPLATE_DESCRIPTIONS =
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Format an error thrown by a sandbox command run. E2B's `commands.run` throws
+ * a `CommandExitError` on non-zero exit, and that error carries `stdout`,
+ * `stderr`, and `exitCode`. The previous catch blocks only read `e.message`
+ * ("exit status 1"), which hid the traceback and caused the model to blind-
+ * retry the same failing code until the run timed out. This surfaces the real
+ * stderr/stdout so the model can fix the actual problem on the next attempt.
+ */
+function formatCommandError(e: any, label: string): string {
+  const exitCode = e?.exitCode ?? e?.exit_code;
+  const stderr = (e?.stderr ?? "").toString().trim();
+  const stdout = (e?.stdout ?? "").toString().trim();
+  const msg = (e?.message ?? String(e)).toString().trim();
+
+  const parts: string[] = [];
+  parts.push(`${label} failed${exitCode != null ? ` (exit ${exitCode})` : ""}.`);
+  if (stderr) parts.push(`stderr:\n${stderr.slice(0, 6000)}`);
+  if (stdout) parts.push(`stdout:\n${stdout.slice(0, 2000)}`);
+  // Only fall back to the bare message when we have no captured output —
+  // otherwise it's just noise like "exit status 1".
+  if (!stderr && !stdout && msg) parts.push(msg.slice(0, 2000));
+  return parts.join("\n\n");
 }
 
 function validatePackageNames(packages: string[]) {
@@ -189,7 +324,7 @@ export const runPythonTool = tool(
         stderr ? `stderr:\n${stderr}` : "",
       ].filter(Boolean).join("\n\n") || "Python finished successfully with no output.";
     } catch (e: any) {
-      return `Failed to run python code: ${e.message}`;
+      return formatCommandError(e, "Python execution");
     }
   },
   {
@@ -214,6 +349,9 @@ export const runTerminalTool = tool(
         return "Refused to dump a binary/media file to terminal output. Use ls/stat/file/ffprobe for verification or get_sandbox_file_url to return the file.";
       }
 
+      const denied = await ensureApproval(command, "Shell command requested by the agent.");
+      if (denied) return denied;
+
       const templateId = selectTemplateForTask("terminal", command, template_id);
       const exec = await runWithSandboxRetry<{ stdout?: string; stderr?: string }>(templateId, (liveSandbox) =>
         liveSandbox.commands.run(command, {
@@ -223,7 +361,7 @@ export const runTerminalTool = tool(
       );
       return `stdout:\n${exec.stdout ?? ""}\nstderr:\n${exec.stderr ?? ""}`;
     } catch (e: any) {
-      return `Failed to run command: ${e.message}`;
+      return formatCommandError(e, "Command");
     }
   },
   {
@@ -255,7 +393,7 @@ export const runNodeTool = tool(
         stderr ? `stderr:\n${stderr}` : "",
       ].filter(Boolean).join("\n\n") || "Node.js finished successfully with no output.";
     } catch (e: any) {
-      return `Failed to run Node.js code: ${e.message}`;
+      return formatCommandError(e, "Node.js execution");
     }
   },
   {
@@ -279,6 +417,15 @@ export const installPackagesTool = tool(
         : manager === "npm"
           ? `mkdir -p /home/user/.candle_node && npm install --prefix /home/user/.candle_node ${quoted}`
           : `apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y ${quoted}`;
+
+      // apt can change system state outside /home/user — prompt the user
+      // before running. pip/npm install only into the project dirs and skip
+      // the prompt by classifying as low risk.
+      if (manager === "apt") {
+        const denied = await ensureApproval(command, `Install apt packages: ${packages.join(", ")}`);
+        if (denied) return denied;
+      }
+
       const exec = await runWithSandboxRetry<{ stdout?: string; stderr?: string }>(templateId, (liveSandbox) =>
         liveSandbox.commands.run(command, {
           timeoutMs: 240_000,
@@ -348,6 +495,8 @@ export const inspectSandboxFileTool = tool(
 export const readSandboxFileTool = tool(
   async ({ path: filePath, max_bytes, template_id }) => {
     try {
+      const blocked = getReadBlockError(filePath);
+      if (blocked) return blocked;
       const limit = Math.min(Math.max(Number(max_bytes || 8000), 1), 64_000);
       const templateId = selectTemplateForCurrentSandbox("read file", filePath, template_id);
       const command = [
@@ -380,6 +529,8 @@ export const readSandboxFileTool = tool(
 export const writeSandboxFileTool = tool(
   async ({ path: filePath, content, encoding, template_id }) => {
     try {
+      const blocked = getWriteBlockError(filePath);
+      if (blocked) return blocked;
       const templateId = selectTemplateForCurrentSandbox("write file", filePath, template_id);
       const data = encoding === "base64"
         ? Uint8Array.from(Buffer.from(content, "base64"))
@@ -411,6 +562,16 @@ export const writeSandboxFileTool = tool(
 export const manageSandboxFilesTool = tool(
   async ({ action, path: sourcePath, target_path, template_id }) => {
     try {
+      // Destructive actions cross the approval gate. Mkdir/copy/zip stay
+      // free since they only add files inside /home/user.
+      if (action === "delete" || action === "move") {
+        const denied = await ensureApproval(
+          `manage_sandbox_files ${action} ${sourcePath}${target_path ? ` -> ${target_path}` : ""}`,
+          `Destructive file operation (${action}) on ${sourcePath}.`
+        );
+        if (denied) return denied;
+      }
+
       const templateId = selectTemplateForCurrentSandbox("manage files", sourcePath, template_id);
       const command = [
         `python3 - <<'PY'`,
@@ -476,11 +637,22 @@ export const manageSandboxFilesTool = tool(
 
 export const httpRequestTool = tool(
   async ({ url, method, headers, body, timeout_ms }) => {
+    const httpMethod = (method || "GET").toUpperCase();
+    // Mutating HTTP methods cross the approval gate. Read-only verbs (GET,
+    // HEAD) skip the prompt — they're equivalent to browse_web in side-
+    // effect terms.
+    if (httpMethod !== "GET" && httpMethod !== "HEAD") {
+      const denied = await ensureApproval(
+        `http_request ${httpMethod} ${url}`,
+        `Mutating HTTP request — ${httpMethod} can change remote state.`
+      );
+      if (denied) return denied;
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.min(Math.max(timeout_ms || 30_000, 1000), 120_000));
     try {
       const response = await fetch(url, {
-        method: method || "GET",
+        method: httpMethod,
         headers,
         body,
         signal: controller.signal,
@@ -542,7 +714,14 @@ export const setE2BTemplateTool = tool(
   },
   {
     name: "set_e2b_template",
-    description: "Set the default E2B template for subsequent Python, terminal, file, artifact, and download tools.",
+    description:
+      "Switch the active E2B sandbox template for subsequent tools. " +
+      "ONLY the default 'candle-autonomous-agent' template ships the full Candle toolchain " +
+      "(Playwright + Chromium browser profile, ffmpeg, tesseract/OCR, pandoc, poppler). " +
+      "The other templates (codex, claude, desktop, etc.) are lighter coding-agent images WITHOUT that toolchain — " +
+      "switching to one will make sandbox_browser, download_video, and screenshot_analyze fail. " +
+      "Use this ONLY for a pure coding/terminal task that benefits from a specific environment, and switch back to the default before any browser/media/OCR work. " +
+      "Switching also starts a FRESH sandbox: files in /home/user from the previous template are not carried over.",
     schema: z.object({
       template: z.string().describe("Template alias or ID, for example codex, claude, desktop, code-interpreter-v1, or an E2B template ID."),
     }),
@@ -802,6 +981,27 @@ function boundedSearchResultCount(maxResults?: number) {
   return Math.max(1, Math.min(25, Math.floor(maxResults as number)));
 }
 
+/**
+ * Map a query's time-sensitivity to a You.com / Brave freshness window.
+ * Returns undefined for evergreen queries so we don't needlessly restrict
+ * results. Keyword-only (no LLM) — runs on every search.
+ */
+function detectFreshness(query: string): "day" | "week" | "month" | undefined {
+  const q = query.toLowerCase();
+  if (/\b(today|breaking|right now|just now|this morning|latest news|live)\b/.test(q)) return "day";
+  if (/\b(this week|past week|recent|recently|latest|current|now)\b/.test(q)) return "week";
+  if (/\b(this month|past month|this year|2025|2026|upcoming|newest)\b/.test(q)) return "month";
+  return undefined;
+}
+
+/** Map You.com-style freshness to a Brave `freshness` token (pd/pw/pm). */
+function braveFreshnessToken(freshness?: string): string | undefined {
+  if (freshness === "day") return "pd";
+  if (freshness === "week") return "pw";
+  if (freshness === "month") return "pm";
+  return undefined;
+}
+
 function stripHtml(value: string) {
   return cheerio.load(`<div>${value}</div>`)("div").text().replace(/\s+/g, " ").trim();
 }
@@ -842,7 +1042,7 @@ function setCachedSearch(query: string, results: any[]) {
  * ============================================================================
  */
 
-async function searchViaYouCom(query: string, targetCount: number): Promise<any[] | null> {
+async function searchViaYouCom(query: string, targetCount: number, opts?: { freshness?: string; country?: string }): Promise<any[] | null> {
   const apiKey = process.env.YOUCOM_API_KEY?.trim();
   if (!apiKey) return null;
 
@@ -850,20 +1050,34 @@ async function searchViaYouCom(query: string, targetCount: number): Promise<any[
     const params = new URLSearchParams({
       query,
       count: String(Math.min(Math.max(targetCount, 1), 20)),
+      // Maximise the paid You.com plan: unrestricted results (the app is for
+      // an adult user who is responsible for their own use — matches the
+      // agent's permissive scope), default English-friendly moderation off.
+      safesearch: (process.env.YOUCOM_SAFESEARCH || "off").trim(),
     });
+    // Time-sensitivity: when the caller detected a "latest/today/news" intent,
+    // pass freshness so You.com returns fresh pages instead of stale ones.
+    if (opts?.freshness) params.set("freshness", opts.freshness);
+    if (opts?.country || process.env.YOUCOM_COUNTRY) {
+      params.set("country", (opts?.country || process.env.YOUCOM_COUNTRY || "").trim());
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12_000);
 
-    const response = await fetch(`https://ydc-index.io/v1/search?${params.toString()}`, {
-      method: "GET",
-      headers: {
-        "X-API-Key": apiKey,
-        "Accept": "application/json",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let response: Response;
+    try {
+      response = await fetch(`https://ydc-index.io/v1/search?${params.toString()}`, {
+        method: "GET",
+        headers: {
+          "X-API-Key": apiKey,
+          "Accept": "application/json",
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) return null;
 
@@ -906,15 +1120,19 @@ async function searchViaDuckDuckGo(query: string, targetCount: number): Promise<
 
     // DuckDuckGo HTML lite endpoint (no API key needed)
     const params = new URLSearchParams({ q: query, kl: "us-en" });
-    const response = await fetch(`https://html.duckduckgo.com/html/?${params.toString()}`, {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "text/html",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let response: Response;
+    try {
+      response = await fetch(`https://html.duckduckgo.com/html/?${params.toString()}`, {
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+          "Accept": "text/html",
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) return null;
 
@@ -954,7 +1172,7 @@ async function searchViaDuckDuckGo(query: string, targetCount: number): Promise<
   }
 }
 
-async function searchViaBrave(query: string, targetCount: number): Promise<any[] | null> {
+async function searchViaBrave(query: string, targetCount: number, opts?: { freshness?: string }): Promise<any[] | null> {
   const apiKey = process.env.BRAVE_SEARCH_API_KEY?.trim();
   if (!apiKey) return null;
 
@@ -968,16 +1186,22 @@ async function searchViaBrave(query: string, targetCount: number): Promise<any[]
       text_decorations: "false",
       search_lang: "en",
     });
+    const freshToken = braveFreshnessToken(opts?.freshness);
+    if (freshToken) params.set("freshness", freshToken);
 
-    const response = await fetch(`https://api.search.brave.com/res/v1/web/search?${params.toString()}`, {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "X-Subscription-Token": apiKey,
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let response: Response;
+    try {
+      response = await fetch(`https://api.search.brave.com/res/v1/web/search?${params.toString()}`, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "X-Subscription-Token": apiKey,
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) return null;
 
@@ -1009,37 +1233,40 @@ async function searchGoogleCustomSearch(query: string, targetCount: number) {
     const timeout = setTimeout(() => controller.abort(), 12_000);
 
     const results: any[] = [];
-    for (let start = 1; results.length < targetCount && start <= 91; start += 10) {
-      const url = new URL("https://www.googleapis.com/customsearch/v1");
-      url.searchParams.set("key", apiKey);
-      url.searchParams.set("cx", cx);
-      url.searchParams.set("q", query);
-      url.searchParams.set("num", String(Math.min(10, targetCount - results.length)));
-      url.searchParams.set("start", String(start));
+    try {
+      for (let start = 1; results.length < targetCount && start <= 91; start += 10) {
+        const url = new URL("https://www.googleapis.com/customsearch/v1");
+        url.searchParams.set("key", apiKey);
+        url.searchParams.set("cx", cx);
+        url.searchParams.set("q", query);
+        url.searchParams.set("num", String(Math.min(10, targetCount - results.length)));
+        url.searchParams.set("start", String(start));
 
-      const response = await fetch(url, { signal: controller.signal });
-      const payload = await response.json() as any;
+        const response = await fetch(url, { signal: controller.signal });
+        const payload = await response.json() as any;
+
+        if (!response.ok) {
+          console.warn(`[search:google] API error ${response.status}: ${payload?.error?.message || ""}`);
+          break;
+        }
+
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        if (!items.length) break;
+        for (const item of items) {
+          if (results.length >= targetCount) break;
+          const resultUrl = String(item.link || "");
+          if (!/^https?:\/\//i.test(resultUrl)) continue;
+          results.push({
+            rank: results.length + 1,
+            title: String(item.title || "").trim(),
+            url: resultUrl,
+            snippet: stripHtml(String(item.htmlSnippet || item.snippet || "")).slice(0, 400),
+            source: "google_api",
+          });
+        }
+      }
+    } finally {
       clearTimeout(timeout);
-
-      if (!response.ok) {
-        console.warn(`[search:google] API error ${response.status}: ${payload?.error?.message || ""}`);
-        break;
-      }
-
-      const items = Array.isArray(payload.items) ? payload.items : [];
-      if (!items.length) break;
-      for (const item of items) {
-        if (results.length >= targetCount) break;
-        const resultUrl = String(item.link || "");
-        if (!/^https?:\/\//i.test(resultUrl)) continue;
-        results.push({
-          rank: results.length + 1,
-          title: String(item.title || "").trim(),
-          url: resultUrl,
-          snippet: stripHtml(String(item.htmlSnippet || item.snippet || "")).slice(0, 400),
-          source: "google_api",
-        });
-      }
     }
 
     return results.length > 0 ? results : undefined;
@@ -1087,25 +1314,35 @@ async function withKernelBrowser<T>(
 
   let proxyId: string | undefined;
   if (opts?.useResidentialProxy) {
-    const proxy = await withTimeout(
-      kernel.proxies.create({ type: "residential", config: { country: "US" }, name: "candle-search" }),
-      15_000,
-      "Kernel residential proxy creation"
-    );
-    proxyId = proxy.id;
+    // If the create call resolves AFTER our timeout rejected, we'd otherwise
+    // leak the proxy (residential proxies have no quick self-expiry). Attach a
+    // late-cleanup so a slow-but-successful create is still torn down.
+    const proxyPromise = kernel.proxies.create({ type: "residential", config: { country: "US" }, name: "candle-search" });
+    try {
+      const proxy = await withTimeout(proxyPromise, 15_000, "Kernel residential proxy creation");
+      proxyId = proxy.id;
+    } catch (err) {
+      void proxyPromise.then((p) => { if (p?.id) kernel.proxies.delete(p.id).catch(() => undefined); }).catch(() => undefined);
+      throw err;
+    }
   }
 
-  const session = await withTimeout(
-    kernel.browsers.create({
-      stealth: true,
-      headless: opts?.headless ?? true,
-      timeout_seconds: timeoutSec,
-      viewport: mobile ? { width: 390, height: 844 } : { width: 1365, height: 900 },
-      ...(proxyId ? { proxy_id: proxyId } : {}),
-    }),
-    20_000,
-    "Kernel browser creation"
-  );
+  const browserPromise = kernel.browsers.create({
+    stealth: true,
+    headless: opts?.headless ?? true,
+    timeout_seconds: timeoutSec,
+    viewport: mobile ? { width: 390, height: 844 } : { width: 1365, height: 900 },
+    ...(proxyId ? { proxy_id: proxyId } : {}),
+  });
+  let session: KernelSession;
+  try {
+    session = await withTimeout(browserPromise, 20_000, "Kernel browser creation");
+  } catch (err) {
+    // Late-resolving browser create → tear it down so it doesn't linger.
+    void browserPromise.then((s) => kernel.browsers.deleteByID(s.session_id).catch(() => undefined)).catch(() => undefined);
+    if (proxyId) await kernel.proxies.delete(proxyId).catch(() => undefined);
+    throw err;
+  }
 
   try {
     return await withTimeout(task(session.session_id, session), timeoutMs, "Kernel browser task");
@@ -1377,10 +1614,15 @@ export const searchWebTool = tool(
         return JSON.stringify(cached.slice(0, targetCount));
       }
 
+      // Detect a time-sensitive query so providers return FRESH pages instead
+      // of stale evergreen ones. Cheap keyword heuristic — maps to You.com /
+      // Brave freshness windows.
+      const freshness = detectFreshness(query);
+
       // Run fast API-based providers in parallel
       const [youResults, braveResults, ddgResults, googleApiResults] = await Promise.allSettled([
-        searchViaYouCom(query, targetCount),
-        searchViaBrave(query, targetCount),
+        searchViaYouCom(query, targetCount, { freshness }),
+        searchViaBrave(query, targetCount, { freshness }),
         searchViaDuckDuckGo(query, targetCount),
         searchGoogleCustomSearch(query, targetCount),
       ]);
@@ -1439,12 +1681,13 @@ export const searchWebTool = tool(
 
 export const browseWebTool = tool(
   async ({ url, max_text_chars }) => {
-    try {
-      const maxChars = Math.max(1000, Math.min(20_000, max_text_chars ?? 7000));
-      return await withKernelBrowser(async (sessionId, session) => {
+    const maxChars = Math.max(1000, Math.min(20_000, max_text_chars ?? 7000));
+
+    const runBrowse = async (useResidentialProxy: boolean) =>
+      withKernelBrowser(async (sessionId, session) => {
         const snapshot = await kernelPlaywright(sessionId, `
-          await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded", timeout: 35000 });
-          await page.waitForTimeout(1500);
+          await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await page.waitForTimeout(1200);
           const title = await page.title();
           const result = await page.evaluate((limit) => {
             const c = (v, m = 500) => String(v ?? "").replace(/\\s+/g, " ").trim().slice(0, m);
@@ -1458,14 +1701,46 @@ export const browseWebTool = tool(
             return { metaDescription, headings, links, text };
           }, ${maxChars});
           return { url: page.url(), title, ...result };
-        `, 45);
-        return JSON.stringify({
+        `, useResidentialProxy ? 34 : 28);
+        return {
           ...snapshot,
           liveViewUrl: session.browser_live_view_url || null,
-        });
-      }, { timeoutMs: 45_000 });
+        };
+      }, { timeoutMs: useResidentialProxy ? 38_000 : 30_000, useResidentialProxy });
+
+    // Detects a bot-wall / verification interstitial in the returned snapshot
+    // so we know the plain fetch was blocked rather than genuinely empty.
+    const looksBlocked = (snap: any): boolean => {
+      const blob = `${snap?.title ?? ""} ${snap?.text ?? ""}`.toLowerCase();
+      return /just a moment|verifying you are human|security verification|enable javascript|cloudflare|attention required|access denied|are you a robot|captcha/.test(blob)
+        || (typeof snap?.text === "string" && snap.text.trim().length < 80);
+    };
+
+    try {
+      const first = await runBrowse(false);
+      if (!looksBlocked(first)) return JSON.stringify(first);
+
+      // First pass hit a bot-wall / near-empty page. Retry ONCE through a
+      // Kernel residential proxy (the paid capability that defeats most
+      // bot detection). If the retry is no better, return its result anyway
+      // so the model still has something to work with.
+      console.warn(`[browse_web] first pass looked blocked — retrying via residential proxy: ${url}`);
+      try {
+        const second = await runBrowse(true);
+        return JSON.stringify(looksBlocked(second) ? { ...second, note: "Page appears bot-protected; content may be incomplete." } : second);
+      } catch {
+        return JSON.stringify({ ...first, note: "Page appears bot-protected; content may be incomplete." });
+      }
     } catch (e: any) {
-      return `Failed to browse web: ${e.message}`;
+      // The plain pass errored/timed out. One residential-proxy retry before
+      // giving up — slow sites sometimes only resolve through a clean IP.
+      try {
+        console.warn(`[browse_web] first pass failed (${e?.message ?? e}) — retrying via residential proxy: ${url}`);
+        const second = await runBrowse(true);
+        return JSON.stringify(second);
+      } catch (e2: any) {
+        return `Failed to browse web: ${e2?.message ?? e2}. The site may be blocking automated access — try sandbox_browser, or search for the same content on another source.`;
+      }
     }
   },
   {
@@ -1481,6 +1756,43 @@ export const browseWebTool = tool(
 export const screenshotAnalyzeTool = tool(
   async ({ url, question, template_id }) => {
     try {
+      const templateId = selectTemplateForTask("screenshot", url, template_id);
+
+      // Local sandbox image (file:// or an absolute /home/user path)? Then we
+      // already HAVE the image in the sandbox — OCR it directly with tesseract
+      // and skip the Kernel cloud browser entirely. Kernel runs in the cloud
+      // and CANNOT open file:// paths on our sandbox, which is exactly why the
+      // previous version failed with ERR_FILE_NOT_FOUND on screenshots that
+      // sandbox_browser had just saved.
+      const localMatch = /^file:\/\/(.+)/.exec(url) || (url.startsWith("/home/user/") ? [url, url] : null);
+      if (localMatch) {
+        const localPath = localMatch[1];
+        const analysis = await runWithSandboxRetry(templateId, async (liveSandbox) => {
+          const code = [
+            "import json, os, subprocess",
+            `p = ${JSON.stringify(localPath)}`,
+            "if not os.path.exists(p): print(json.dumps({'error': 'file not found: ' + p})); raise SystemExit(0)",
+            "info = subprocess.run(['file', p], capture_output=True, text=True).stdout.strip()",
+            "ocr = ''",
+            "try:",
+            "    r = subprocess.run(['tesseract', p, 'stdout', '-l', 'mya+eng'], capture_output=True, text=True, timeout=40)",
+            "    ocr = (r.stdout or '').strip()[:4000] or (r.stderr or '').strip()[:500]",
+            "except Exception as e:",
+            "    ocr = 'OCR error: ' + str(e)",
+            "try:",
+            "    from PIL import Image",
+            "    dim = '{}x{}'.format(*Image.open(p).size)",
+            "except Exception:",
+            "    dim = 'unknown'",
+            "print(json.dumps({'path': p, 'fileInfo': info, 'dimensions': dim, 'ocrText': ocr, 'sizeBytes': os.path.getsize(p) if os.path.exists(p) else 0}, ensure_ascii=False))",
+          ].join("\n");
+          const exec = await liveSandbox.commands.run(`python3 -c ${shellQuote(code)}`, { timeoutMs: 60_000, requestTimeoutMs: 60_000 });
+          return exec.stdout?.trim() || exec.stderr?.trim() || "Image analysis produced no output.";
+        });
+        const questionContext = question ? `\nUser question: ${question}` : "";
+        return `Image analysis:\n${analysis}${questionContext}`;
+      }
+
       // Take screenshot via Kernel browser, save to sandbox, analyze with Python (OCR/description)
       const screenshotBase64 = await withKernelBrowser(async (sessionId) => {
         const result = await kernelPlaywright(sessionId, `
@@ -1496,63 +1808,32 @@ export const screenshotAnalyzeTool = tool(
         return "Failed to capture screenshot.";
       }
 
-      // Save screenshot to sandbox and run basic analysis
-      const templateId = selectTemplateForTask("screenshot", url, template_id);
+      // Save screenshot to sandbox and run OCR analysis on the EXACT path we
+      // just wrote (no timestamp-glob guessing, which could pick the wrong
+      // image if another screenshot exists in the sandbox).
       const analysis = await runWithSandboxRetry(templateId, async (liveSandbox) => {
         const screenshotPath = `/home/user/screenshot_${Date.now()}.png`;
         const imageData = Uint8Array.from(Buffer.from(screenshotBase64, "base64"));
         await liveSandbox.files.write(screenshotPath, imageData, { requestTimeoutMs: 60_000 });
 
-        const code = `
-import json, os, subprocess, sys
-
-screenshot_path = ${JSON.stringify(`/home/user/screenshot_${Date.now()}.png`)}
-# Use the actual saved path
-import glob
-screenshots = sorted(glob.glob("/home/user/screenshot_*.png"), key=os.path.getmtime, reverse=True)
-screenshot_path = screenshots[0] if screenshots else screenshot_path
-
-# Get basic image info
-result = subprocess.run(["file", screenshot_path], capture_output=True, text=True)
-file_info = result.stdout.strip()
-
-# Try OCR if tesseract is available
-ocr_text = ""
-try:
-    result = subprocess.run(
-        ["tesseract", screenshot_path, "stdout", "-l", "eng+mya"],
-        capture_output=True, text=True, timeout=30
-    )
-    ocr_text = result.stdout.strip()[:4000]
-except Exception:
-    # Try installing tesseract
-    try:
-        subprocess.run(["apt-get", "install", "-y", "-qq", "tesseract-ocr"], capture_output=True, timeout=60)
-        result = subprocess.run(
-            ["tesseract", screenshot_path, "stdout"],
-            capture_output=True, text=True, timeout=30
-        )
-        ocr_text = result.stdout.strip()[:4000]
-    except Exception as e:
-        ocr_text = f"OCR unavailable: {e}"
-
-# Get image dimensions
-try:
-    from PIL import Image
-    img = Image.open(screenshot_path)
-    dimensions = f"{img.width}x{img.height}"
-except Exception:
-    dimensions = "unknown"
-
-print(json.dumps({
-    "path": screenshot_path,
-    "fileInfo": file_info,
-    "dimensions": dimensions,
-    "ocrText": ocr_text,
-    "sizeBytes": os.path.getsize(screenshot_path),
-}, ensure_ascii=False))
-`;
-        const exec = await liveSandbox.commands.run(`python3 -c ${JSON.stringify(code)}`, {
+        const code = [
+          "import json, os, subprocess",
+          `p = ${JSON.stringify(screenshotPath)}`,
+          "info = subprocess.run(['file', p], capture_output=True, text=True).stdout.strip()",
+          "ocr = ''",
+          "try:",
+          "    r = subprocess.run(['tesseract', p, 'stdout', '-l', 'mya+eng'], capture_output=True, text=True, timeout=40)",
+          "    ocr = (r.stdout or '').strip()[:4000] or (r.stderr or '').strip()[:500]",
+          "except Exception as e:",
+          "    ocr = 'OCR error: ' + str(e)",
+          "try:",
+          "    from PIL import Image",
+          "    dim = '{}x{}'.format(*Image.open(p).size)",
+          "except Exception:",
+          "    dim = 'unknown'",
+          "print(json.dumps({'path': p, 'fileInfo': info, 'dimensions': dim, 'ocrText': ocr, 'sizeBytes': os.path.getsize(p) if os.path.exists(p) else 0}, ensure_ascii=False))",
+        ].join("\n");
+        const exec = await liveSandbox.commands.run(`python3 -c ${shellQuote(code)}`, {
           timeoutMs: 60_000,
           requestTimeoutMs: 60_000,
         });
@@ -1671,3 +1952,377 @@ export const browserInteractTool = tool(
     }),
   }
 );
+
+// ────────────────────────────────────────────────────────────────────────────
+// SANDBOX_BROWSER — in-sandbox Playwright with persistent profile
+// ────────────────────────────────────────────────────────────────────────────
+// Why this tool exists alongside `browse_web` and `browser_interact`:
+//   - browse_web: read-only HTML fetch, no JS execution, no auth.
+//   - browser_interact: Kernel cloud stealth browser. Ephemeral, no shared
+//     state with the sandbox filesystem, costs against Kernel quota.
+//   - sandbox_browser (THIS): Playwright running inside the agent's own E2B
+//     sandbox. Cookies / localStorage persist across calls within a session
+//     (same sandbox), downloaded files land directly under /home/user/
+//     so subsequent `run_python` / `run_terminal` calls can process them
+//     without an extra hop, and a follow-up screenshot can be analyzed by
+//     `screenshot_analyze` against the same image. Use this for multi-step
+//     workflows that need login state or that produce files for downstream
+//     processing.
+//
+// Action surface mirrors `browser_interact` so the model can swap between
+// them with minimal cognitive overhead, plus three additions: download,
+// scroll, screenshot. Each call drives a fresh Python+Playwright process —
+// the persistent state lives in the user-data directory on disk, not in a
+// long-running browser handle.
+// ────────────────────────────────────────────────────────────────────────────
+
+const SANDBOX_BROWSER_PROFILE = "/home/user/.candle_browser_profile";
+const SANDBOX_BROWSER_DOWNLOADS = "/home/user/downloads";
+const SANDBOX_BROWSER_SCREENSHOTS = "/home/user/screenshots";
+
+const sandboxBrowserActionSchema = z.object({
+  type: z.enum([
+    "goto",
+    "click",
+    "type",
+    "press",
+    "select",
+    "scroll",
+    "wait",
+    "extract",
+    "screenshot",
+    "download",
+  ]).describe("Action kind."),
+  selector: z.string().optional().describe("CSS selector for click/type/press/select/extract/download actions."),
+  text: z.string().optional().describe("Text to type for type actions."),
+  key: z.string().optional().describe("Keyboard key for press actions (e.g. 'Enter', 'Tab')."),
+  value: z.string().optional().describe("Value for select actions."),
+  url: z.string().optional().describe("URL for goto actions."),
+  filename: z.string().optional().describe("Optional output filename for screenshot/download actions (relative to /home/user/downloads or /home/user/screenshots)."),
+  pixels: z.number().optional().describe("Pixels to scroll vertically for scroll actions (negative scrolls up)."),
+  milliseconds: z.number().optional().describe("Delay for wait actions, or post-action settle for click/type/press."),
+  waitForNavigation: z.boolean().optional().describe("Wait briefly for navigation/network idle after click/press. Defaults to true for click and press."),
+  fullPage: z.boolean().optional().describe("Capture full scrollable page for screenshot actions. Defaults to false."),
+});
+
+/**
+ * Build the Python driver script. The script reads a JSON manifest from the
+ * `MANIFEST` env var so we never interpolate user-controlled strings into the
+ * script body — closes the obvious code-injection vector. The script writes
+ * a JSON envelope on stdout summarising every step.
+ */
+const SANDBOX_BROWSER_DRIVER = String.raw`
+import json, os, sys, time, traceback
+from pathlib import Path
+
+manifest = json.loads(os.environ.get("MANIFEST", "{}"))
+actions = manifest.get("actions") or []
+mobile = bool(manifest.get("mobile"))
+reset_profile = bool(manifest.get("reset_profile"))
+profile_dir = manifest.get("profileDir") or "/home/user/.candle_browser_profile"
+downloads_dir = manifest.get("downloadsDir") or "/home/user/downloads"
+screenshots_dir = manifest.get("screenshotsDir") or "/home/user/screenshots"
+overall_timeout_ms = int(manifest.get("overallTimeoutMs") or 90000)
+
+if reset_profile and os.path.isdir(profile_dir):
+    import shutil
+    shutil.rmtree(profile_dir, ignore_errors=True)
+
+Path(profile_dir).mkdir(parents=True, exist_ok=True)
+Path(downloads_dir).mkdir(parents=True, exist_ok=True)
+Path(screenshots_dir).mkdir(parents=True, exist_ok=True)
+
+events = []
+
+def event(action, ok, detail):
+    events.append({"action": action, "ok": ok, "detail": detail})
+
+def safe_filename(name, fallback):
+    if not name:
+        return fallback
+    cleaned = "".join(c for c in name if c.isalnum() or c in "-_.")
+    return cleaned or fallback
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "playwright not available: " + str(e), "events": events}))
+    sys.exit(1)
+
+start = time.time()
+result = {"ok": False, "events": events, "artifacts": []}
+
+with sync_playwright() as pw:
+    viewport = {"width": 390, "height": 844} if mobile else {"width": 1280, "height": 800}
+    user_agent = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        if mobile else
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    try:
+        ctx = pw.chromium.launch_persistent_context(
+            profile_dir,
+            headless=True,
+            accept_downloads=True,
+            viewport=viewport,
+            user_agent=user_agent,
+            channel="chromium",
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        )
+    except Exception as e:
+        result["error"] = "failed to launch browser: " + str(e)
+        print(json.dumps(result))
+        sys.exit(1)
+
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.set_default_timeout(15000)
+    page.set_default_navigation_timeout(20000)
+
+    try:
+        for idx, raw in enumerate(actions):
+            if (time.time() - start) * 1000 > overall_timeout_ms:
+                event("budget", False, "overall timeout reached, stopping")
+                break
+
+            kind = raw.get("type")
+            try:
+                if kind == "goto":
+                    url = raw.get("url") or ""
+                    if not url:
+                        event("goto", False, "missing url")
+                        continue
+                    page.goto(url, wait_until="domcontentloaded")
+                    event("goto", True, {"url": page.url, "title": page.title()})
+
+                elif kind == "click":
+                    sel = raw.get("selector") or ""
+                    if not sel:
+                        event("click", False, "missing selector")
+                        continue
+                    page.locator(sel).first.click()
+                    if raw.get("waitForNavigation", True):
+                        try: page.wait_for_load_state("networkidle", timeout=4000)
+                        except PWTimeoutError: pass
+                    event("click", True, {"selector": sel})
+
+                elif kind == "type":
+                    sel = raw.get("selector") or ""
+                    text = raw.get("text") or ""
+                    if not sel:
+                        event("type", False, "missing selector")
+                        continue
+                    page.locator(sel).first.fill(text)
+                    event("type", True, {"selector": sel, "chars": len(text)})
+
+                elif kind == "press":
+                    key = raw.get("key") or "Enter"
+                    sel = raw.get("selector")
+                    if sel:
+                        page.locator(sel).first.press(key)
+                    else:
+                        page.keyboard.press(key)
+                    if raw.get("waitForNavigation", True):
+                        try: page.wait_for_load_state("networkidle", timeout=4000)
+                        except PWTimeoutError: pass
+                    event("press", True, {"key": key, "selector": sel})
+
+                elif kind == "select":
+                    sel = raw.get("selector") or ""
+                    val = raw.get("value") or ""
+                    if not sel:
+                        event("select", False, "missing selector")
+                        continue
+                    page.locator(sel).first.select_option(val)
+                    event("select", True, {"selector": sel, "value": val})
+
+                elif kind == "scroll":
+                    px = int(raw.get("pixels") or 600)
+                    page.evaluate("(p) => window.scrollBy(0, p)", px)
+                    event("scroll", True, {"pixels": px})
+
+                elif kind == "wait":
+                    ms = int(raw.get("milliseconds") or 1000)
+                    page.wait_for_timeout(min(ms, 15000))
+                    event("wait", True, {"milliseconds": ms})
+
+                elif kind == "extract":
+                    sel = raw.get("selector")
+                    if sel:
+                        nodes = page.locator(sel).all()[:30]
+                        texts = [n.inner_text()[:1000] for n in nodes]
+                    else:
+                        texts = [page.inner_text("body")[:8000]]
+                    event("extract", True, {"texts": texts})
+
+                elif kind == "screenshot":
+                    name = safe_filename(raw.get("filename"), "screenshot_" + str(int(time.time()*1000)) + ".png")
+                    if not name.endswith((".png", ".jpg", ".jpeg")):
+                        name += ".png"
+                    out = os.path.join(screenshots_dir, name)
+                    page.screenshot(path=out, full_page=bool(raw.get("fullPage")))
+                    event("screenshot", True, {"path": out})
+                    result["artifacts"].append({"path": out, "filename": name, "kind": "screenshot"})
+
+                elif kind == "download":
+                    sel = raw.get("selector") or ""
+                    if not sel:
+                        event("download", False, "missing selector")
+                        continue
+                    with page.expect_download(timeout=20000) as info:
+                        page.locator(sel).first.click()
+                    dl = info.value
+                    suggested = dl.suggested_filename or "download.bin"
+                    name = safe_filename(raw.get("filename"), suggested)
+                    out = os.path.join(downloads_dir, name)
+                    dl.save_as(out)
+                    size = os.path.getsize(out) if os.path.exists(out) else 0
+                    event("download", True, {"path": out, "filename": name, "bytes": size})
+                    result["artifacts"].append({"path": out, "filename": name, "kind": "download", "bytes": size})
+
+                else:
+                    event(kind or "unknown", False, "unsupported action type")
+
+            except PWTimeoutError as e:
+                event(kind, False, "timeout: " + str(e)[:200])
+            except Exception as e:
+                event(kind, False, "error: " + str(e)[:300])
+
+        # Always finish with a tail screenshot for downstream visual verification
+        # unless the last action was already a screenshot.
+        if not actions or actions[-1].get("type") != "screenshot":
+            try:
+                tail = os.path.join(screenshots_dir, "tail_" + str(int(time.time()*1000)) + ".png")
+                page.screenshot(path=tail, full_page=False)
+                result["artifacts"].append({"path": tail, "filename": os.path.basename(tail), "kind": "tail_screenshot"})
+            except Exception:
+                pass
+
+        result["ok"] = True
+        result["finalUrl"] = page.url
+        try:
+            result["title"] = page.title()
+        except Exception:
+            result["title"] = ""
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+print(json.dumps(result, ensure_ascii=False))
+`;
+
+export const sandboxBrowserTool = tool(
+  async ({ actions, mobile, reset_profile, template_id }) => {
+    const trimmedActions = (actions ?? []).slice(0, 12);
+    if (trimmedActions.length === 0) {
+      return JSON.stringify({ ok: false, error: "No actions provided." });
+    }
+    const manifest = {
+      actions: trimmedActions,
+      mobile: Boolean(mobile),
+      reset_profile: Boolean(reset_profile),
+      profileDir: SANDBOX_BROWSER_PROFILE,
+      downloadsDir: SANDBOX_BROWSER_DOWNLOADS,
+      screenshotsDir: SANDBOX_BROWSER_SCREENSHOTS,
+      overallTimeoutMs: 90_000,
+    };
+
+    try {
+      const templateId = selectTemplateForTask("sandbox_browser", "", template_id);
+      // The driver always writes its JSON envelope to stdout — even on
+      // failure. Catch the e2b CommandExitError so the model still sees the
+      // structured error instead of an opaque "exit status 1".
+      const execution = await runWithSandboxRetry<{ stdout?: string; stderr?: string; exitCode?: number }>(
+        templateId,
+        async (liveSandbox) => {
+          const driverPath = `/home/user/.candle_browser_driver_${Date.now()}.py`;
+          await liveSandbox.files.write(driverPath, SANDBOX_BROWSER_DRIVER, { requestTimeoutMs: 60_000 });
+          try {
+            return await liveSandbox.commands.run(`python3 ${driverPath}`, {
+              timeoutMs: 110_000,
+              requestTimeoutMs: 110_000,
+              envs: {
+                MANIFEST: JSON.stringify(manifest),
+                // The E2B sandbox doesn't propagate Dockerfile ENV to the
+                // command runtime, so we re-export it here. The Dockerfile
+                // installed Playwright binaries under this system-wide path
+                // so the unprivileged sandbox user can read them.
+                PLAYWRIGHT_BROWSERS_PATH: "/usr/local/share/ms-playwright",
+              },
+            });
+          } catch (err: any) {
+            // e2b throws CommandExitError on non-zero exits but still hands
+            // back the captured stdout/stderr on the error object. Forward
+            // them so we can surface the driver's JSON envelope.
+            if (err?.result) {
+              return err.result;
+            }
+            throw err;
+          }
+        }
+      );
+
+      const stdout = (execution.stdout ?? "").trim();
+      const stderr = (execution.stderr ?? "").trim();
+
+      // The driver always prints a single JSON envelope on stdout. If parsing
+      // fails we fall back to returning the raw stderr — usually a Python
+      // traceback that helps the model recover.
+      let parsed: any = null;
+      if (stdout) {
+        try {
+          // Driver may emit warnings before the JSON; take the LAST line.
+          const lines = stdout.split(/\r?\n/).filter((l) => l.trim().length > 0);
+          parsed = JSON.parse(lines[lines.length - 1]);
+        } catch {
+          parsed = null;
+        }
+      }
+
+      if (!parsed) {
+        return `Sandbox browser failed to produce a JSON envelope.\nstdout:\n${stdout.slice(0, 1500)}\nstderr:\n${stderr.slice(0, 1500)}`;
+      }
+
+      // Promote the FIRST artifact (if any) to the top-level url/path so
+      // ArtifactRegistry.extractFromToolOutput picks it up automatically.
+      const firstArtifact = Array.isArray(parsed.artifacts) ? parsed.artifacts[0] : null;
+      if (firstArtifact?.path) {
+        parsed.path = firstArtifact.path;
+        if (firstArtifact.filename) parsed.filename = firstArtifact.filename;
+      }
+      return JSON.stringify(parsed);
+    } catch (e: any) {
+      return `Failed to drive sandbox browser: ${e?.message ?? e}`;
+    }
+  },
+  {
+    name: "sandbox_browser",
+    description:
+      "Drive a persistent Chromium browser INSIDE the agent's E2B sandbox via Playwright. " +
+      "Use when you need login state to persist across tool calls, when downloaded files must land in the sandbox filesystem for downstream processing, or when you want a screenshot you can post-process with screenshot_analyze. " +
+      "For one-shot read-only fetches prefer browse_web; for stealth / non-sandbox interaction prefer browser_interact. " +
+      "IMPORTANT: each call runs a FRESH browser process — the live page does NOT carry over between calls. Cookies/localStorage DO persist (under /home/user/.candle_browser_profile), but the open page does not. So EVERY call must start with a `goto` action; do not call `extract`/`click` alone expecting the previous call's page (it will be about:blank). Put goto + interact + extract/screenshot in ONE call's actions array. " +
+      "Pass reset_profile=true to wipe cookies. Returns a JSON envelope { ok, finalUrl, title, events, artifacts }.",
+    schema: z.object({
+      actions: z.array(sandboxBrowserActionSchema).min(1).max(12).describe("Ordered actions to run. Up to 12 per call."),
+      mobile: z.boolean().optional().describe("Use a mobile viewport + UA. Defaults to false."),
+      reset_profile: z.boolean().optional().describe("Wipe the persistent profile before launching. Defaults to false."),
+      template_id: z.string().optional().describe(TEMPLATE_DESCRIPTIONS),
+    }),
+  }
+);
+
+/**
+ * Tear down the sandbox for a specific session id (typically the WebSocket
+ * connection id). Called from `server.ts` on connection close. Errors are
+ * logged but not thrown — we never want cleanup to mask the original failure.
+ */
+export async function closeSandboxForSession(sessionId: string): Promise<void> {
+  if (!sandboxes.has(sessionId)) return;
+  await withSessionLock(sessionId, () => closeSandboxForSessionUnlocked(sessionId));
+  sandboxes.delete(sessionId);
+}

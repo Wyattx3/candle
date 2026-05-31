@@ -9,6 +9,7 @@ export interface HeaderProps {
   showDropdownIndicator?: boolean;
   showBackButton?: boolean;
   onHistoryPress?: () => void;
+  onSkillsPress?: () => void;
   onPress?: () => void;
   isScrolled?: boolean;
 }
@@ -33,10 +34,23 @@ const SvgNewChat = ({ size = 20, color = '#1C1C1E' }: { size?: number; color?: s
   </Svg>
 );
 
+const SvgSparkle = ({ size = 20, color = '#1C1C1E' }: { size?: number; color?: string }) => (
+  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <Path
+      d="M12 3l2.4 5.4L19.8 11l-5.4 2.6L12 19l-2.4-5.4L4.2 11l5.4-2.6L12 3z"
+      stroke={color}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </Svg>
+);
+
 export const Header: React.FC<HeaderProps> = ({
   title = 'Candle',
   showDropdownIndicator = true,
   onHistoryPress,
+  onSkillsPress,
   onPress,
   isScrolled = false,
 }) => {
@@ -75,9 +89,10 @@ export const Header: React.FC<HeaderProps> = ({
 
       <TouchableOpacity
         activeOpacity={0.72}
+        onPress={onSkillsPress}
         accessible
         accessibilityRole="button"
-        accessibilityLabel="New chat"
+        accessibilityLabel={onSkillsPress ? 'Review skill suggestions' : 'New chat'}
       >
         <LiquidGlass
           variant="pill"
@@ -86,7 +101,7 @@ export const Header: React.FC<HeaderProps> = ({
           style={styles.iconGlass}
           contentStyle={styles.iconContent}
         >
-          <SvgNewChat size={18} />
+          {onSkillsPress ? <SvgSparkle size={18} /> : <SvgNewChat size={18} />}
         </LiquidGlass>
       </TouchableOpacity>
     </View>

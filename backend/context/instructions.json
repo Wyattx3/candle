@@ -15,7 +15,7 @@
     "id": "web-research-strategy",
     "title": "Web research and identification",
     "tags": ["web", "research", "search", "identify", "find", "anime", "movie", "song"],
-    "content": "For identifying something by description: 1) First search uses the MOST UNIQUE details (character names, specific scenes, unusual features) — not generic descriptions. 2) Target Reddit, MAL, forums with 'identify' or 'help find' in query. 3) If first search fails, try completely different angle: different language (try Japanese/Myanmar terms), different detail subset, or browse a promising thread. 4) After 3 failed searches, present closest matches and ask 1-2 narrowing questions (year range, art style, platform where they saw it). Never rephrase same keywords."
+    "content": "For identifying something by description: 1) First search uses the MOST UNIQUE details (character names, specific scenes, unusual features) — not generic descriptions. 2) Target Reddit, MAL, forums with 'identify' or 'help find' in query. 3) If first search fails, try a completely different angle: a different language (use the original-language terms when applicable), a different detail subset, or browse a promising thread. 4) After 3 failed searches, present closest matches and ask 1-2 narrowing questions (year range, art style, platform where they saw it). Never rephrase same keywords."
   },
   {
     "id": "code-sandbox-workflow",
@@ -48,10 +48,10 @@
     "content": "Search efficiency: 1) For simple facts (who/what/when), use AT MOST 1 search. If snippets answer it, respond immediately. 2) For current data (prices, versions, scores), 1 search is enough — use the most authoritative snippet. 3) Never do a second search to 'verify' a simple fact. 4) Prefer search snippets over browsing full pages. 5) If you know the answer from training data and it's not time-sensitive, answer WITHOUT any search."
   },
   {
-    "id": "myanmar-language-handling",
-    "title": "Myanmar language interaction",
-    "tags": ["myanmar", "burmese", "language", "translation", "unicode"],
-    "content": "For Myanmar language: 1) Always respond in Myanmar if the user writes in Myanmar. 2) For searches about Myanmar content, try both Myanmar Unicode and English transliteration. 3) Myanmar text processing in Python: use 'myanmar-tools' or regex with Unicode ranges (\\u1000-\\u109F). 4) For translation tasks, use run_python with googletrans or deep-translator library. 5) Be aware of Zawgyi vs Unicode encoding issues — normalize to Unicode first."
+    "id": "multilingual-handling",
+    "title": "Non-English language interaction",
+    "tags": ["language", "multilingual", "translation", "unicode", "i18n"],
+    "content": "When the user writes in a non-English language: 1) Reply in the same language unless they explicitly switch. 2) For searches, try both the original-language terms and an English transliteration / translation when the topic is region-specific. 3) For text-processing code, respect the script's Unicode ranges and use established libraries (e.g. ICU, language-specific tokenizers, deep-translator) rather than ad-hoc regex. 4) Be aware that some scripts have legacy encodings (e.g. older fonts vs Unicode); normalize to Unicode before processing. 5) Never assume English is the default — preserve the user's language choice in the final answer."
   },
   {
     "id": "error-recovery-patterns",

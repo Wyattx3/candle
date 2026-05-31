@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleProp, ViewStyle, ScrollView } from 'react-native';
 import Svg, { Path, Circle, Polyline, Line, Rect } from 'react-native-svg';
+import { LiquidGlass } from './LiquidGlass';
 
 /**
  * ============================================================================
@@ -118,26 +119,31 @@ const getStepIcon = (type: string) => {
  */
 
 const TaskProgressPill: React.FC<{ text: string }> = ({ text }) => (
-  <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFFFFF', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 24, borderWidth: 1, borderColor: '#E5E7EB', alignSelf: 'flex-start', marginBottom: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 2, elevation: 1 }}>
+  <LiquidGlass
+    variant="pill"
+    borderRadius={24}
+    style={{ alignSelf: 'flex-start', marginBottom: 16 }}
+    contentStyle={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8 }}
+  >
     <SvgGreenDot size={16} />
     <Text style={{ color: '#374151', fontSize: 13, fontWeight: '500', marginLeft: 8, marginRight: 16 }}>{text}</Text>
     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
       <SvgFolder size={16} color="#4B5563" />
       <SvgSquareFrame size={16} color="#4B5563" />
     </View>
-  </View>
+  </LiquidGlass>
 );
 
 const TaskListCard: React.FC<{ steps: KimiTaskStep[] }> = ({ steps }) => {
   if (!steps || steps.length === 0) return null;
-  
+
   return (
-    <View style={{ backgroundColor: '#FFFFFF', borderRadius: 12, borderWidth: 1, borderColor: '#E5E7EB', overflow: 'hidden', marginVertical: 12 }}>
+    <LiquidGlass variant="thin" borderRadius={12} style={{ marginVertical: 12 }} contentStyle={{ overflow: 'hidden' }}>
       {steps.map((step, index) => {
         const Icon = getStepIcon(step.type);
         const isLast = index === steps.length - 1;
         return (
-          <View key={step.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, borderBottomWidth: isLast ? 0 : 1, borderBottomColor: '#F3F4F6' }}>
+          <View key={step.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, borderBottomWidth: isLast ? 0 : 1, borderBottomColor: 'rgba(255,255,255,0.5)' }}>
             <Icon size={16} color="#6B7280" />
             <Text style={{ color: '#4B5563', fontSize: 13, marginLeft: 12 }}>{step.actionName}</Text>
             <Text style={{ color: '#D1D5DB', fontSize: 13, marginHorizontal: 8 }}>|</Text>
@@ -146,16 +152,21 @@ const TaskListCard: React.FC<{ steps: KimiTaskStep[] }> = ({ steps }) => {
           </View>
         );
       })}
-    </View>
+    </LiquidGlass>
   );
 };
 
 const ThoughtBlockUI: React.FC<{ thoughtTitle: string }> = ({ thoughtTitle }) => (
-  <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFFFFF', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, borderWidth: 1, borderColor: '#F3F4F6', alignSelf: 'flex-start', marginBottom: 12 }}>
+  <LiquidGlass
+    variant="thin"
+    borderRadius={8}
+    style={{ alignSelf: 'flex-start', marginBottom: 12 }}
+    contentStyle={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8 }}
+  >
     <SvgLightBulb size={14} color="#6B7280" />
     <Text style={{ color: '#6B7280', fontSize: 13, fontWeight: '400', marginLeft: 8, marginRight: 8 }}>{thoughtTitle}</Text>
     <SvgChevronRight size={14} color="#9CA3AF" />
-  </View>
+  </LiquidGlass>
 );
 
 /**

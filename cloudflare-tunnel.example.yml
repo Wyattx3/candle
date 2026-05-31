@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloudflare Tunnel config for Candle backend
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to `cloudflare-tunnel.yml` (already gitignored) and fill in
+# the real values from `cloudflared tunnel create`. Then run:
+#
+#   npm run backend:tunnel   # tunnel only
+#   npm run dev:all          # backend + tunnel + Expo Metro
+#
+# See docs/cloudflare-tunnel.md for the full step-by-step.
+
+# UUID printed by `cloudflared tunnel create candle-backend`.
+tunnel: 00000000-0000-0000-0000-000000000000
+
+# Path to the credentials JSON written by `tunnel create`.
+# Windows default: C:\Users\<you>\.cloudflared\<UUID>.json
+# macOS / Linux:   ~/.cloudflared/<UUID>.json
+credentials-file: C:\Users\YOU\.cloudflared\00000000-0000-0000-0000-000000000000.json
+
+# Ingress rules. Point your hostname at the local backend (port 3000 by default).
+# The WebSocket endpoint and the HTTP REST routes share the same Express app,
+# so one ingress entry covers both.
+ingress:
+  - hostname: ws.candlecan.art
+    service: http://localhost:3000
+    originRequest:
+      # Bump these only if your runs hit the cap. Defaults are usually fine.
+      connectTimeout: 30s
+      noTLSVerify: false
+  - service: http_status:404

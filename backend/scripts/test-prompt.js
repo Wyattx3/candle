@@ -8,7 +8,7 @@
 const WebSocket = require("ws");
 
 const WS_URL = "ws://localhost:3000";
-const PROMPT = "naruto manga chapter 1 download ပြီးပို့ပေးပါ";
+const PROMPT = "Download chapter 1 of Naruto manga and send me the file.";
 
 const ws = new WebSocket(WS_URL);
 let eventCount = 0;

@@ -49,6 +49,11 @@ app-example
 # backend secrets — never commit
 backend/.env
 
+# backend runtime/generated state — not source
+backend/.candle_memory.json
+backend/data/
+backend/pdf-e2e.out
+
 # backend build
 backend/dist/
 backend/build/
