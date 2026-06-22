@@ -56,12 +56,15 @@ describe("extractInlineReasoning", () => {
     expect(cleaned).toBe("Here is the plan.");
   });
 
-  it("removes stray orphan tags", () => {
-    const input = "answer</think> tail";
-    const { cleaned } = extractInlineReasoning(input);
+  it("treats text before an orphan </think> as reasoning (GLM/DeepSeek-R1 leak)", () => {
+    // Reasoning models stream their thinking via reasoning_content, then leak
+    // `…draft</think>answer` into the content channel. Everything before the
+    // orphan close tag is the draft/thinking; the real answer follows it.
+    const input = "draft thoughts</think>the real answer";
+    const { reasoning, cleaned } = extractInlineReasoning(input);
     expect(cleaned).not.toContain("</think>");
-    expect(cleaned).toContain("answer");
-    expect(cleaned).toContain("tail");
+    expect(cleaned).toBe("the real answer");
+    expect(reasoning).toBe("draft thoughts");
   });
 
   it("is case-insensitive on tag names", () => {

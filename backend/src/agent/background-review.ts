@@ -24,12 +24,17 @@
  *    self-imposed constraints that bite later.
  */
 
-import { contentToText } from "./helpers";
+import { contentToText, extractJsonObject } from "./helpers";
 import { auxLLM } from "./llm";
+
+// Re-exported for back-compat: this helper moved to ./helpers so curator.ts can
+// share it without a circular import. Existing importers still reach it here.
+export { extractJsonObject };
 import { memoryStore, MemoryEntry } from "./memory";
 import { createSkill, getSkillByName, listSkills, updateSkill } from "../skills";
 import { redactSecrets } from "../security";
-import { maybeRunCurator } from "./curator";
+import { maybeRunCurator, maybeRunCuratorConsolidation } from "./curator";
+import { maybeSynthesizeUserModel } from "./memory-synthesis";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Config
@@ -183,40 +188,8 @@ function buildReviewPrompt(input: BackgroundReviewInput): string {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// JSON extraction + validation
+// Validation
 // ────────────────────────────────────────────────────────────────────────────
-
-/** Pull the first balanced JSON object out of an LLM response (handles fences/prose). */
-export function extractJsonObject(text: string): any | null {
-  if (!text) return null;
-  let cleaned = text.trim();
-  // Strip ```json ... ``` fences if present.
-  const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (fence) cleaned = fence[1].trim();
-
-  const start = cleaned.indexOf("{");
-  if (start === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = start; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        const slice = cleaned.slice(start, i + 1);
-        try { return JSON.parse(slice); } catch { return null; }
-      }
-    }
-  }
-  return null;
-}
 
 const VALID_CATEGORIES: MemoryEntry["category"][] = [
   "user_preference",
@@ -376,6 +349,12 @@ export async function maybeBackgroundReview(input: BackgroundReviewInput): Promi
     // Opportunistically run the curator FSM (inactivity-gated, no-LLM). A new
     // skill may have just been created; keep the library healthy over time.
     maybeRunCurator();
+    // Opt-in LLM consolidation (own longer cadence, only when CURATOR_CONSOLIDATE
+    // is set). Fire-and-forget — never awaited, never blocks the reply.
+    void maybeRunCuratorConsolidation();
+    // Proactive user-model synthesis (own cadence). Distills scattered facts
+    // into one coherent profile. Fire-and-forget — never blocks the reply.
+    void maybeSynthesizeUserModel();
     return actions;
   } catch (err: any) {
     console.warn(`[review] background review failed: ${err?.message ?? err}`);

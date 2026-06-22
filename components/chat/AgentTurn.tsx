@@ -11,9 +11,13 @@ import { GenUIBlock } from '@/components/GenUI/GenUIBlock';
 import { Candle, CandleFontFamilies } from '@/constants/theme';
 import type { AiMessage, AiStreamNode } from '@/hooks/chat-types';
 import { ApprovalCard } from './ApprovalCard';
+import { MarkdownText } from './MarkdownText';
 import { ReasoningRow } from './ReasoningRow';
 import { SecurityCard } from './SecurityCard';
-import { ToolRow } from './ToolRow';
+import { ToolRow, ToolShimmerRow } from './ToolRow';
+
+/** Grok-style: only the most recent N tool rows get full UI; older ones shimmer. */
+const TOOL_ROW_CAP = 2;
 
 interface AgentTurnProps {
   message: AiMessage;
@@ -58,6 +62,11 @@ export function AgentTurn({ message }: AgentTurnProps) {
     (n): n is Extract<AiStreamNode, { type: 'genui' }> => n.type === 'genui',
   );
 
+  // Only the most recent TOOL_ROW_CAP tool rows show full UI; older ones
+  // collapse to a shimmer placeholder (Grok-style).
+  const toolIds = actionNodes.filter((n) => n.type === 'tool').map((n) => n.id);
+  const fullToolIds = new Set(toolIds.slice(-TOOL_ROW_CAP));
+
   return (
     <View style={styles.turn}>
       {/* Agent head */}
@@ -72,13 +81,21 @@ export function AgentTurn({ message }: AgentTurnProps) {
 
       {/* Action pane */}
       {actionNodes.length > 0 ? (
-        <View style={styles.actionPane}>{actionNodes.map(renderNode)}</View>
+        <View style={styles.actionPane}>
+          {actionNodes.map((node) =>
+            node.type === 'tool' && !fullToolIds.has(node.id) ? (
+              <ToolShimmerRow key={node.id} node={node} />
+            ) : (
+              renderNode(node)
+            ),
+          )}
+        </View>
       ) : null}
 
       {/* Answer */}
       {answer.length > 0 ? (
         <View style={styles.ansWrap}>
-          <Text style={styles.answer}>{answer}</Text>
+          <MarkdownText content={answer} />
         </View>
       ) : null}
 
@@ -126,12 +143,6 @@ const styles = StyleSheet.create({
   },
   ansWrap: {
     paddingHorizontal: 20,
-  },
-  answer: {
-    fontFamily: CandleFontFamilies.inter,
-    fontSize: 15,
-    lineHeight: 15 * 1.5,
-    color: Candle.textPrimary,
   },
   genuiWrap: {
     paddingHorizontal: 20,

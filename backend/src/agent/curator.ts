@@ -26,12 +26,18 @@
 import * as fs from "fs";
 import * as path from "path";
 import { agentCreatedReport, setState, SkillUsageRecord } from "../skill-usage";
+import { auxLLM } from "./llm";
+import { contentToText, extractJsonObject } from "./helpers";
+import { listSkills, getSkillByName, updateSkill, deleteSkill } from "../skills";
+import { redactSecrets } from "../security";
 
 const STATE_FILE = path.resolve(__dirname, "../../data/curator_state.json");
 
 interface CuratorState {
   lastRunAt: number | null;
   lastRunSummary: string;
+  /** Independent cadence for the opt-in LLM consolidation pass. */
+  lastConsolidationAt?: number | null;
 }
 
 function num(envName: string, def: number, min: number, max: number): number {
@@ -58,13 +64,14 @@ function loadState(): CuratorState {
         return {
           lastRunAt: typeof parsed.lastRunAt === "number" ? parsed.lastRunAt : null,
           lastRunSummary: typeof parsed.lastRunSummary === "string" ? parsed.lastRunSummary : "",
+          lastConsolidationAt: typeof parsed.lastConsolidationAt === "number" ? parsed.lastConsolidationAt : null,
         };
       }
     }
   } catch (err) {
     console.warn(`[curator] failed to load state: ${(err as any)?.message ?? err}`);
   }
-  return { lastRunAt: null, lastRunSummary: "" };
+  return { lastRunAt: null, lastRunSummary: "", lastConsolidationAt: null };
 }
 
 function saveState(state: CuratorState): void {
@@ -143,6 +150,194 @@ export function maybeRunCurator(now: number = Date.now()): CuratorCounts | null 
     return counts;
   } catch (err: any) {
     console.warn(`[curator] run failed: ${err?.message ?? err}`);
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LLM CONSOLIDATION PASS (opt-in) — merge overlapping skills into umbrellas
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The FSM above only retires unused skills. It can't notice that three
+// narrowly-scoped skills are really the same workflow that should be ONE
+// umbrella skill. Hermes does that with an LLM review pass; Candle mirrors the
+// background-review shape: a single auxLLM call returns a typed JSON plan we
+// validate against guardrails and apply deterministically (no tool loop, so it
+// can't go rogue). Off by default — set CURATOR_CONSOLIDATE=1 to enable.
+
+function consolidateEnabled(): boolean {
+  const raw = (process.env.CURATOR_CONSOLIDATE ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "on" || raw === "yes";
+}
+
+function consolidationIntervalHours(): number {
+  return num("CURATOR_CONSOLIDATE_INTERVAL_HOURS", 72, 1, 24 * 60);
+}
+
+export interface ConsolidationMerge {
+  into: string;
+  absorb: string[];
+  description?: string;
+  body?: string;
+}
+
+export interface ConsolidationCounts {
+  merges: number;
+  absorbed: number;
+}
+
+const NAME_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
+
+function buildConsolidationPrompt(skills: { name: string; description: string }[]): string {
+  const list = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
+  return (
+    "You are a SKILL-LIBRARY CURATOR for an autonomous agent named Candle. " +
+    "Below is the list of AGENT-CREATED skills (procedural workflows). Over time the agent " +
+    "creates narrow, overlapping skills that are really the SAME class of task. Your job is to " +
+    "identify clusters that should be merged into a single class-level UMBRELLA skill.\n\n" +
+    `AGENT-CREATED SKILLS:\n${list}\n\n` +
+    "RULES:\n" +
+    "- Only merge skills that are genuinely the same KIND of task (e.g. 'merge-2-pdfs' + 'combine-pdf-files' → 'pdf-merge-workflow').\n" +
+    "- Do NOT merge skills that are merely adjacent (e.g. 'pdf-merge' and 'pdf-split' stay separate).\n" +
+    "- The umbrella `into` may be one of the existing names (preferred) or a new class-level kebab-case name.\n" +
+    "- `absorb` lists the OTHER existing skill names folded into the umbrella; never include `into` in its own `absorb`.\n" +
+    "- Provide a merged `description` (<=200 chars) and `body` (full Markdown workflow covering all absorbed cases).\n" +
+    "- Be conservative. If nothing should merge, return an empty list. Most libraries need no merges.\n\n" +
+    "OUTPUT — return ONLY a JSON object, no prose, no code fences:\n" +
+    '{ "merges": [ { "into": "kebab-case", "absorb": ["name-a","name-b"], "description": "<=200 chars", "body": "full Markdown workflow" } ] }\n' +
+    'If nothing should merge, return {"merges": []}.'
+  );
+}
+
+export function validateConsolidationPlan(
+  raw: any,
+  eligible: Set<string>,
+  pinned: Set<string>
+): ConsolidationMerge[] {
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.merges)) return [];
+  const out: ConsolidationMerge[] = [];
+  const claimed = new Set<string>();
+
+  for (const m of raw.merges.slice(0, 10)) {
+    if (!m || typeof m !== "object") continue;
+    const into = String(m.into ?? "").trim().toLowerCase();
+    if (!NAME_RE.test(into)) continue;
+
+    const absorb = Array.isArray(m.absorb)
+      ? Array.from(
+          new Set(
+            m.absorb
+              .map((a: any) => String(a).trim().toLowerCase())
+              .filter((a: string) => NAME_RE.test(a) && a !== into)
+          )
+        )
+      : [];
+
+    // Every absorbed skill must be an existing, eligible (agent-created),
+    // non-pinned skill we haven't already claimed in another merge.
+    const validAbsorb = (absorb as string[]).filter(
+      (a) => eligible.has(a) && !pinned.has(a) && !claimed.has(a)
+    );
+    if (validAbsorb.length === 0) continue;
+
+    // The umbrella itself, if it's an existing skill, must not be pinned.
+    if (eligible.has(into) && pinned.has(into)) continue;
+    // Creating a brand-new umbrella requires a body + description.
+    const intoExists = eligible.has(into);
+    const description = m.description ? String(m.description).trim().slice(0, 200) : undefined;
+    const body = m.body ? String(m.body).trim().slice(0, 16_000) : undefined;
+    if (!intoExists && (!description || !body)) continue;
+
+    for (const a of validAbsorb) claimed.add(a);
+    claimed.add(into);
+    out.push({ into, absorb: validAbsorb, description, body });
+  }
+  return out;
+}
+
+/**
+ * Opt-in LLM consolidation. Inactivity-gated on its own (longer) cadence so it
+ * never runs on every review. Fire-and-forget safe — never throws.
+ */
+export async function maybeRunCuratorConsolidation(
+  now: number = Date.now()
+): Promise<ConsolidationCounts | null> {
+  try {
+    if (!curatorEnabled() || !consolidateEnabled()) return null;
+
+    const state = loadState();
+    if (state.lastConsolidationAt == null) {
+      saveState({ ...state, lastConsolidationAt: now });
+      return null;
+    }
+    if (now - state.lastConsolidationAt < consolidationIntervalHours() * 60 * 60 * 1000) {
+      return null;
+    }
+
+    const records = agentCreatedReport();
+    const eligible = new Set(records.map((r) => r.name));
+    const pinned = new Set(records.filter((r) => r.pinned).map((r) => r.name));
+
+    // Only consider non-archived, non-pinned agent skills as merge inputs.
+    const candidates = listSkills().filter(
+      (s) => eligible.has(s.name) && !pinned.has(s.name)
+    );
+    // Nothing to consolidate below 3 skills — not worth an LLM call.
+    if (candidates.length < 3) {
+      saveState({ ...state, lastConsolidationAt: now });
+      return { merges: 0, absorbed: 0 };
+    }
+
+    const prompt = buildConsolidationPrompt(
+      candidates.map((s) => ({ name: s.name, description: s.description }))
+    );
+    const response = await auxLLM.invoke([{ role: "user", content: prompt }], {
+      tags: ["candle-internal"],
+    });
+    const plan = validateConsolidationPlan(
+      extractJsonObject(contentToText(response.content)),
+      eligible,
+      pinned
+    );
+
+    let merges = 0;
+    let absorbed = 0;
+    for (const m of plan) {
+      try {
+        const intoExists = getSkillByName(m.into);
+        if (intoExists) {
+          if (m.description || m.body) {
+            updateSkill({ name: m.into, description: m.description, body: m.body });
+          }
+        } else {
+          // Build the umbrella from one of the absorbed skill bodies as a base
+          // if the model didn't give one — but validation already requires a
+          // body for new umbrellas, so m.body is present here.
+          updateSkill({ name: m.into, description: m.description, body: m.body });
+        }
+        for (const name of m.absorb) {
+          // Never delete the umbrella itself.
+          if (name === m.into) continue;
+          deleteSkill(name); // also forgets the usage record
+          absorbed += 1;
+        }
+        merges += 1;
+      } catch (err: any) {
+        console.warn(`[curator] consolidation merge into "${m.into}" failed: ${redactSecrets(String(err?.message ?? err))}`);
+      }
+    }
+
+    saveState({
+      lastRunAt: state.lastRunAt,
+      lastRunSummary: state.lastRunSummary,
+      lastConsolidationAt: now,
+    });
+    if (merges > 0) {
+      console.log(`[curator] consolidation pass: ${merges} merge(s), ${absorbed} skill(s) absorbed.`);
+    }
+    return { merges, absorbed };
+  } catch (err: any) {
+    console.warn(`[curator] consolidation failed: ${redactSecrets(String(err?.message ?? err))}`);
     return null;
   }
 }

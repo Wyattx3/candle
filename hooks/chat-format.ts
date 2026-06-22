@@ -78,15 +78,30 @@ export function nextId(prefix: string): string {
 export function toolActionName(toolName: string): string {
   switch (toolName) {
     case 'search_web':
+    case 'semantic_search':
       return 'Search';
+    case 'research':
+      return 'Research';
+    case 'finance_research':
+      return 'Finance';
     case 'browse_web':
       return 'Browse';
     case 'browser_interact':
+    case 'sandbox_browser':
       return 'Browser';
+    case 'screenshot_analyze':
+      return 'Screenshot';
     case 'run_python':
+    case 'run_python_with_tools':
       return 'Python';
+    case 'run_node':
+      return 'Node';
     case 'run_terminal':
       return 'Terminal';
+    case 'install_packages':
+      return 'Install';
+    case 'http_request':
+      return 'Request';
     case 'spawn_subagent':
       return 'Subagent';
     case 'spawn_subagents_parallel':
@@ -94,10 +109,16 @@ export function toolActionName(toolName: string): string {
     case 'skill_view':
     case 'skill_manage':
       return 'Skill';
+    case 'write_sandbox_file':
+    case 'read_sandbox_file':
+    case 'inspect_sandbox_file':
+    case 'manage_sandbox_files':
     case 'create_artifact':
     case 'list_sandbox_files':
     case 'get_sandbox_file_url':
       return 'File';
+    case 'patch':
+      return 'Edit';
     case 'download_video':
       return 'Video';
     case 'list_e2b_templates':
@@ -105,6 +126,22 @@ export function toolActionName(toolName: string): string {
       return 'E2B';
     case 'capability_catalog':
       return 'Toolbox';
+    case 'app_source':
+      return 'App';
+    case 'cronjob':
+      return 'Schedule';
+    case 'kanban':
+      return 'Board';
+    case 'todo':
+      return 'Tasks';
+    case 'clarify':
+      return 'Question';
+    case 'recall_runs':
+      return 'Recall';
+    case 'store_memory':
+    case 'search_memory':
+    case 'delete_memory':
+      return 'Memory';
     default:
       return 'Executing';
   }

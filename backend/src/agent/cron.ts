@@ -26,6 +26,8 @@ export interface CronJob {
   id: string;
   task: string;
   intervalMinutes: number;
+  /** Optional upstream job whose latest output is prepended to this job's prompt. */
+  contextFromJobId?: string;
   lastRun?: string;
   lastError?: string;
   lastResult?: string;
@@ -76,14 +78,19 @@ export class CronManager {
     fs.writeFileSync(CRON_FILE_PATH, JSON.stringify(this.jobs, null, 2));
   }
 
-  public addJob(task: string, intervalMinutes: number): CronJob {
+  public addJob(task: string, intervalMinutes: number, contextFromJobId?: string): CronJob {
     const trimmed = (task || "").trim();
     if (!trimmed) throw new Error("Cron task must not be empty.");
     if (intervalMinutes < 1) throw new Error("Cron interval must be at least 1 minute.");
+    const upstream = (contextFromJobId || "").trim();
+    if (upstream && !this.jobs.some((j) => j.id === upstream)) {
+      throw new Error(`Upstream job "${upstream}" not found. Create it first, then chain this job to it.`);
+    }
     const newJob: CronJob = {
       id: Math.random().toString(36).substring(2, 10),
       task: trimmed,
       intervalMinutes: Math.floor(intervalMinutes),
+      ...(upstream ? { contextFromJobId: upstream } : {}),
     };
     this.jobs.push(newJob);
     this.saveJobs();
@@ -124,6 +131,22 @@ export class CronManager {
     this.timers.set(job.id, timer);
   }
 
+  /**
+   * Prepend an upstream job's latest output to this job's task when chained.
+   * Resolved at fire time so the chain always uses the freshest output.
+   */
+  private resolveTaskWithContext(job: CronJob): string {
+    if (!job.contextFromJobId) return job.task;
+    const upstream = this.jobs.find((j) => j.id === job.contextFromJobId);
+    if (!upstream?.lastResult) return job.task;
+    return (
+      `--- Context from upstream job ${upstream.id} ---\n` +
+      `${upstream.lastResult}\n` +
+      `--- End context ---\n\n` +
+      job.task
+    );
+  }
+
   private async execute(job: CronJob) {
     if (!registeredRunner) {
       console.warn(`[cron] Skip job ${job.id} — no runner registered yet.`);
@@ -131,9 +154,9 @@ export class CronManager {
     }
     console.log(`[cron] Executing job ${job.id}: ${job.task.slice(0, 80)}`);
     try {
-      const result = await registeredRunner(job.task);
+      const result = await registeredRunner(this.resolveTaskWithContext(job));
       job.lastRun = new Date().toISOString();
-      job.lastResult = String(result ?? "").slice(0, 1000);
+      job.lastResult = String(result ?? "").slice(0, 4000);
       delete job.lastError;
     } catch (e: any) {
       job.lastRun = new Date().toISOString();

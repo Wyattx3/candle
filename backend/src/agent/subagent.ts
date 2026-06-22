@@ -30,7 +30,7 @@ import { getSkillIndexText } from "../skills";
 import { getMcpCatalogText } from "../mcp";
 import { MODEL_NAME } from "./llm";
 
-export const MAX_SUBAGENT_TOOL_CALLS = 14;
+export const MAX_SUBAGENT_TOOL_CALLS = 50;
 const MAX_SUBAGENT_OUTPUT_CHARS = 6000;
 export const SUBAGENT_TIMEOUT_MS = 120_000;
 
@@ -83,11 +83,14 @@ async function runSingleSubagent(
 
   const subCtx = new RunContext(trimmed, 0);
   subCtx.complexity = "complex";
+  // Single binding limit (Hermes-style): only the total call count caps a
+  // worker. search/browse are tracked but no longer gate, so mirror the call
+  // budget here rather than imposing tiny sub-caps that are now dead config.
   subCtx.budget = {
     maxToolCalls: MAX_SUBAGENT_TOOL_CALLS,
-    maxSearchCalls: Math.min(subCtx.budget.maxSearchCalls, 4),
-    maxBrowseCalls: Math.min(subCtx.budget.maxBrowseCalls, 2),
-    warningAt: Math.max(2, MAX_SUBAGENT_TOOL_CALLS - 4),
+    maxSearchCalls: MAX_SUBAGENT_TOOL_CALLS,
+    maxBrowseCalls: MAX_SUBAGENT_TOOL_CALLS,
+    warningAt: Math.max(2, MAX_SUBAGENT_TOOL_CALLS - 6),
   };
   subCtx.costCeiling = costCeiling;
 
@@ -115,7 +118,7 @@ async function runSingleSubagent(
     const finalState: any = await subgraph.invoke(
       { messages: [systemMessage, { role: "user", content: trimmed }] },
       {
-        recursionLimit: Math.min(40, MAX_SUBAGENT_TOOL_CALLS * 3),
+        recursionLimit: MAX_SUBAGENT_TOOL_CALLS * 3,
         signal,
         // Tag the entire subgraph run as internal. In modern LangGraph,
         // config/callbacks propagate into tool calls via AsyncLocalStorage,

@@ -1,21 +1,27 @@
 /**
- * Tool-call budget enforcement. Three layers:
- *  1) Complexity classifier (`classifyQueryComplexity`) buckets each prompt
- *     into simple / moderate / complex from heuristics on the prompt text and
- *     conversation length.
- *  2) Static caps (`TOOL_BUDGETS`) per complexity: max calls, max searches,
- *     max browses, plus a warning threshold the model gets nudged at.
- *  3) Weighted cost ceiling (`TOOL_COST_WEIGHTS` + `COST_CEILINGS`) so
- *     expensive tools (browser, subagent) count more than cheap lookups.
- *     The cost score lives on RunContext.
+ * Tool-call budget enforcement (Hermes-style single binding limit).
+ *
+ * The ONLY hard cap is the total tool-call count per run — mirroring Hermes'
+ * `IterationBudget` (parent 90, subagent 50). The complexity classifier still
+ * routes the LLM tier (noTools / research) and picks a generous call budget,
+ * but the per-search / per-browse sub-caps and the weighted cost ceiling no
+ * longer BLOCK a run: they were tripping legitimate multi-step work far too
+ * early. `costScore` / `searchCallCount` / `browseCallCount` are still tracked
+ * for telemetry and the wrap-up warning nudge.
  */
 
 import { QueryComplexity, ToolBudget } from "./types";
 
+// Search is the spiral-prone tool: with fetch_content=true ONE search already
+// returns ~6 full pages, so a handful is plenty. maxSearchCalls is kept TIGHT
+// (and gated in RunContext.trackToolCall) to force the model to stop querying
+// and ANSWER from what it has, instead of re-searching forever and flooding the
+// provider into rate limits. The overall maxToolCalls stays generous so genuine
+// Execute/build tasks (many file/run ops) aren't choked.
 export const TOOL_BUDGETS: Record<QueryComplexity, ToolBudget> = {
-  simple: { maxToolCalls: 3, maxSearchCalls: 2, maxBrowseCalls: 1, warningAt: 2 },
-  moderate: { maxToolCalls: 14, maxSearchCalls: 7, maxBrowseCalls: 4, warningAt: 10 },
-  complex: { maxToolCalls: 30, maxSearchCalls: 12, maxBrowseCalls: 8, warningAt: 24 },
+  simple: { maxToolCalls: 10, maxSearchCalls: 3, maxBrowseCalls: 4, warningAt: 8 },
+  moderate: { maxToolCalls: 40, maxSearchCalls: 6, maxBrowseCalls: 8, warningAt: 34 },
+  complex: { maxToolCalls: 90, maxSearchCalls: 12, maxBrowseCalls: 16, warningAt: 80 },
 };
 
 /**
@@ -25,12 +31,16 @@ export const TOOL_BUDGETS: Record<QueryComplexity, ToolBudget> = {
  */
 export const TOOL_COST_WEIGHTS: Record<string, number> = {
   search_web: 2,
+  research: 4,
+  finance_research: 5,
   browse_web: 3,
   browser_interact: 4,
   sandbox_browser: 5,
   screenshot_analyze: 3,
   download_video: 3,
+  transcribe_audio: 3,
   run_python: 2,
+  run_python_with_tools: 4,
   run_node: 2,
   run_terminal: 1,
   install_packages: 2,
@@ -44,6 +54,8 @@ export const TOOL_COST_WEIGHTS: Record<string, number> = {
   list_e2b_templates: 1,
   skill_view: 1,
   skill_manage: 1,
+  recall_runs: 1,
+  kanban: 1,
 };
 
 export const COST_CEILINGS: Record<QueryComplexity, number> = {

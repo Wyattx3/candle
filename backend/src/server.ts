@@ -7,6 +7,7 @@ import * as os from "os";
 import { WebSocket, WebSocketServer } from "ws";
 import { AgentAbortError, AgentTimeoutError, ArtifactRegistry, ChatHistoryMessage, runAgentStream, checkpointStore } from "./agent";
 import { cronManager } from "./agent/cron";
+import { kanbanBoard } from "./agent/kanban";
 import { setMcpTools } from "./agent/llm";
 import {
   deleteSuggestion,
@@ -174,6 +175,39 @@ app.post("/runs/:id/resume", async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ resumedFrom: record.runId, error: String(err?.message ?? err) });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Kanban work board API — inspect + control the persistent task queue.
+// `GET /kanban`            — list every task on the board.
+// `GET /kanban/:id`        — one task's full record.
+// `POST /kanban/:id/cancel`  — cancel a non-terminal task.
+// `POST /kanban/:id/unblock` — re-queue a blocked task.
+// `DELETE /kanban/:id`     — cancel (alias) for UI delete affordances.
+// ─────────────────────────────────────────────────────────────────────────
+app.get("/kanban", (_req, res) => {
+  res.json({ tasks: kanbanBoard.listTasks(), active: kanbanBoard.activeCount() });
+});
+
+app.get("/kanban/:id", (req, res) => {
+  const task = kanbanBoard.getTask(req.params.id);
+  if (!task) return res.status(404).json({ error: "Task not found" });
+  res.json(task);
+});
+
+app.post("/kanban/:id/cancel", (req, res) => {
+  const ok = kanbanBoard.cancelTask(req.params.id);
+  res.status(ok ? 200 : 404).json({ cancelled: ok });
+});
+
+app.post("/kanban/:id/unblock", (req, res) => {
+  const ok = kanbanBoard.unblockTask(req.params.id);
+  res.status(ok ? 200 : 409).json({ unblocked: ok });
+});
+
+app.delete("/kanban/:id", (req, res) => {
+  const ok = kanbanBoard.cancelTask(req.params.id);
+  res.status(ok ? 200 : 404).json({ cancelled: ok });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -730,6 +764,12 @@ server.listen(PORT, HOST, () => {
   // it here documents the side effect and keeps it from being tree-shaken.
   console.log(`[cron] ${cronManager.count()} job(s) loaded from disk.`);
 
+  // Start the Kanban dispatcher. Its constructor already loaded the board and
+  // recovered any task left `running` by a crash; start() begins the dispatch
+  // loop so persisted work resumes immediately.
+  kanbanBoard.start();
+  console.log(`[kanban] dispatcher started — ${kanbanBoard.activeCount()} active task(s) on the board.`);
+
   // Boot-time recovery — any "running" checkpoint that survived a crash is
   // a zombie. Promote it to "interrupted" so the operator can decide what
   // to do (resume, drop, or inspect via /runs).
@@ -767,13 +807,28 @@ async function gracefulShutdown(reason: string) {
     /* ignore */
   }
   try {
+    kanbanBoard.stop();
+  } catch {
+    /* ignore */
+  }
+  try {
     await shutdownMcpHost();
   } catch (err: any) {
     console.warn(`[server] mcp shutdown error: ${err?.message ?? err}`);
   }
+  // Force-close every WebSocket so `server.close()` can release the port
+  // immediately. Otherwise an open client (e.g. a connected phone) keeps the
+  // socket alive, port 3000 stays bound through the force-exit window, and a
+  // nodemon restart races into EADDRINUSE.
+  try {
+    for (const client of wss.clients) client.terminate();
+    wss.close();
+  } catch {
+    /* ignore */
+  }
   server.close(() => process.exit(0));
   // Force-exit if close() hangs.
-  setTimeout(() => process.exit(0), 5_000).unref();
+  setTimeout(() => process.exit(0), 1_500).unref();
 }
 
 process.on("SIGINT", () => void gracefulShutdown("SIGINT"));

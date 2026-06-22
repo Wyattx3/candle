@@ -6,6 +6,7 @@ import { z } from "zod";
 import { getSessionId } from "./agent/session";
 import { classifyCommandRisk, getApprovalGate } from "./approvals";
 import { getReadBlockError, getWriteBlockError } from "./agent/file-safety";
+import { redactSecrets } from "./security";
 
 /**
  * Per-session E2B sandbox registry.
@@ -951,6 +952,61 @@ print("CANDLE_DOWNLOAD_RESULT=" + json.dumps(payload, ensure_ascii=False))
   }
 );
 
+/**
+ * Speech-to-text for audio attachments. GAIA (and real users) hand the agent
+ * voice memos / recordings whose CONTENT is the answer — the agent must read
+ * them, not tell the user to transcribe them. The sandbox has ffmpeg but no
+ * local ASR model, so we call Cloudflare Workers AI Whisper (same account/key
+ * as the primary LLM) over HTTP: read the file's bytes out of the sandbox,
+ * base64-encode, POST to whisper-large-v3-turbo, return the transcript.
+ */
+export const transcribeAudioTool = tool(
+  async ({ path: filePath, template_id }) => {
+    const acct = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+    const key = process.env.CLOUDFLARE_API_KEY?.trim();
+    if (!acct || !key) {
+      return "Transcription unavailable: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY are not configured.";
+    }
+    try {
+      const templateId = selectTemplateForCurrentSandbox("transcribe audio", filePath, template_id);
+      // Pull the raw audio bytes out of the sandbox.
+      const bytes: Uint8Array = await runWithSandboxRetry(templateId, (liveSandbox) =>
+        liveSandbox.files.read(filePath, { format: "bytes", requestTimeoutMs: 120_000 })
+      );
+      if (!bytes || bytes.byteLength === 0) {
+        return `Transcription failed: file at ${filePath} is empty or unreadable.`;
+      }
+      const b64 = Buffer.from(bytes).toString("base64");
+      const url = `https://api.cloudflare.com/client/v4/accounts/${acct}/ai/run/@cf/openai/whisper-large-v3-turbo`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ audio: b64 }),
+      });
+      const json: any = await resp.json().catch(() => null);
+      if (!resp.ok || !json?.result) {
+        const detail = json?.errors?.[0]?.message ?? `HTTP ${resp.status}`;
+        return `Transcription failed: ${detail}`;
+      }
+      const text: string = (json.result.text ?? "").trim();
+      if (!text) return "Transcription returned no speech (the audio may be silent or non-speech).";
+      return JSON.stringify({ path: filePath, sizeBytes: bytes.byteLength, transcript: text });
+    } catch (e: any) {
+      return `Transcription failed: ${e?.message ?? e}`;
+    }
+  },
+  {
+    name: "transcribe_audio",
+    description:
+      "Transcribe a speech audio file (.mp3/.wav/.m4a/.ogg/.flac) that is staged inside the sandbox to text, using Cloudflare Whisper. " +
+      "Use this whenever a task provides an audio attachment whose spoken content you need — never tell the user to transcribe it themselves.",
+    schema: z.object({
+      path: z.string().describe("Absolute path to the audio file INSIDE the sandbox (e.g. /home/user/gaia_files/memo.mp3)."),
+      template_id: z.string().optional().describe(TEMPLATE_DESCRIPTIONS),
+    }),
+  }
+);
+
 // --- Kernel browser infrastructure ---
 let _kernelClient: InstanceType<typeof Kernel> | null = null;
 function getKernelClient() {
@@ -1110,6 +1166,166 @@ async function searchViaYouCom(query: string, targetCount: number, opts?: { fres
     return merged.slice(0, targetCount).map((r, i) => ({ rank: i + 1, ...r }));
   } catch {
     return null;
+  }
+}
+
+interface YouSource {
+  url: string;
+  title: string;
+  snippets?: string[];
+}
+
+interface YouResearchResult {
+  content: string;
+  sources: YouSource[];
+}
+
+/**
+ * You.com Research API — does search + fetch + read + synthesize server-side in
+ * ONE call, returning a cited answer plus its sources. We hand the synthesized
+ * content + sources back to the agent's own model so IT writes the final reply
+ * (in the user's language / Candle's voice) — you.com does the legwork, Kimi
+ * stays the author.
+ */
+async function youResearch(
+  input: string,
+  effort: "lite" | "standard" | "deep" | "exhaustive",
+  endpoint: "research" | "finance_research",
+  freshness?: string,
+): Promise<YouResearchResult | null> {
+  const apiKey = process.env.YOUCOM_API_KEY?.trim();
+  if (!apiKey) return null;
+
+  const body: Record<string, unknown> = { input: input.slice(0, 40_000), research_effort: effort };
+  if (endpoint === "research" && freshness) {
+    body.source_control = { freshness };
+  }
+
+  // Deep research can take a while server-side; give it a generous ceiling.
+  const timeoutMs = effort === "exhaustive" ? 290_000 : effort === "deep" ? 180_000 : 90_000;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`https://api.you.com/v1/${endpoint}`, {
+      method: "POST",
+      headers: {
+        "X-API-Key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`you.com ${endpoint} HTTP ${response.status}: ${detail.slice(0, 200)}`);
+    }
+    const data = (await response.json()) as any;
+    const out = data?.output ?? {};
+    const content = typeof out.content === "string" ? out.content : JSON.stringify(out.content ?? "");
+    const sources: YouSource[] = Array.isArray(out.sources)
+      ? out.sources.map((s: any) => ({
+          url: String(s?.url ?? ""),
+          title: String(s?.title ?? ""),
+          snippets: Array.isArray(s?.snippets) ? s.snippets.slice(0, 3) : undefined,
+        }))
+      : [];
+    if (!content) return null;
+    return { content, sources };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * You.com Contents API — fetch full page content (markdown) for one or more
+ * URLs in a single call. No browser. Returns null when nothing usable comes
+ * back so callers can fall back to a plain HTTP fetch or the stealth browser.
+ */
+async function fetchViaYouContents(
+  url: string,
+  maxChars: number,
+): Promise<{ url: string; title: string; markdown: string } | null> {
+  const apiKey = process.env.YOUCOM_API_KEY?.trim();
+  if (!apiKey) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch("https://ydc-index.io/v1/contents", {
+      method: "POST",
+      headers: {
+        "X-API-Key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({ urls: [url], formats: ["markdown", "metadata"], crawl_timeout: 15 }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const data = (await response.json()) as any;
+    const first = Array.isArray(data) ? data[0] : (Array.isArray(data?.results) ? data.results[0] : null);
+    if (!first) return null;
+    const markdown = typeof first.markdown === "string" ? first.markdown : "";
+    if (!markdown.trim()) return null;
+    return {
+      url: String(first.url ?? url),
+      title: String(first.title ?? first.metadata?.site_name ?? ""),
+      markdown: markdown.slice(0, maxChars),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * You.com Contents API — batch-fetch full page content (markdown) for MANY
+ * URLs in ONE HTTP call. This is what lets `search_web` read the top results in
+ * parallel instead of issuing a separate browse_web round-trip per page. Each
+ * returned item is { url, title, markdown } (markdown trimmed to maxCharsPerPage);
+ * pages that fail to crawl are silently dropped.
+ */
+async function fetchManyViaYouContents(
+  urls: string[],
+  maxCharsPerPage: number,
+): Promise<{ url: string; title: string; markdown: string }[]> {
+  const apiKey = process.env.YOUCOM_API_KEY?.trim();
+  if (!apiKey || urls.length === 0) return [];
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const response = await fetch("https://ydc-index.io/v1/contents", {
+      method: "POST",
+      headers: {
+        "X-API-Key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({ urls: urls.slice(0, 10), formats: ["markdown", "metadata"], crawl_timeout: 15 }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return [];
+    const data = (await response.json()) as any;
+    const items: any[] = Array.isArray(data) ? data : (Array.isArray(data?.results) ? data.results : []);
+    const out: { url: string; title: string; markdown: string }[] = [];
+    for (const item of items) {
+      const markdown = typeof item?.markdown === "string" ? item.markdown : "";
+      if (!markdown.trim()) continue;
+      out.push({
+        url: String(item.url ?? ""),
+        title: String(item.title ?? item.metadata?.site_name ?? ""),
+        markdown: markdown.slice(0, maxCharsPerPage),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1492,85 +1708,6 @@ export const officialAndroidAppTool = tool(
   }
 );
 
-async function searchGoogleViaKernel(query: string, targetCount: number) {
-  return withKernelBrowser(async (sessionId) => {
-    const code = `
-      const results = [];
-      const seen = new Set();
-      const targetCount = ${targetCount};
-
-      for (let start = 0; results.length < targetCount && start <= 30; start += 10) {
-        const url = new URL("https://www.google.com/search");
-        url.searchParams.set("q", ${JSON.stringify(query)});
-        url.searchParams.set("hl", "en");
-        url.searchParams.set("num", String(Math.min(10, targetCount - results.length)));
-        url.searchParams.set("filter", "0");
-        url.searchParams.set("pws", "0");
-        if (start > 0) url.searchParams.set("start", String(start));
-
-        await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(2000);
-
-        // CAPTCHA handling: wait for Kernel auto-CAPTCHA solver
-        let pageUrl = page.url();
-        if (pageUrl.includes("/sorry/") || pageUrl.includes("consent.google")) {
-          for (let attempt = 0; attempt < 4; attempt++) {
-            await page.waitForTimeout(5000);
-            pageUrl = page.url();
-            if (!pageUrl.includes("/sorry/") && !pageUrl.includes("consent.google")) break;
-          }
-          if (pageUrl.includes("/sorry/")) {
-            throw new Error("Google CAPTCHA not resolved");
-          }
-        }
-
-        const html = await page.content();
-        let addedThisPage = 0;
-
-        const links = await page.$$eval('#search a[href]', (els) => {
-          return els.map(el => {
-            const h3 = el.querySelector('h3');
-            const title = h3 ? h3.innerText.replace(/\\s+/g, ' ').trim() : '';
-            const href = el.getAttribute('href') || '';
-            const container = el.closest('div')?.parentElement;
-            const snippet = container ? container.innerText.replace(/\\s+/g, ' ').trim() : '';
-            return { title, href, snippet };
-          }).filter(l => l.title);
-        });
-
-        for (const link of links) {
-          if (results.length >= targetCount) break;
-          let resultUrl = link.href;
-          try {
-            const u = new URL(resultUrl, "https://www.google.com");
-            const q = u.searchParams.get("q") || u.searchParams.get("url");
-            if (q) resultUrl = decodeURIComponent(q);
-            else resultUrl = u.toString();
-          } catch {}
-          if (!/^https?:\\/\\//.test(resultUrl)) continue;
-          try {
-            const hostname = new URL(resultUrl).hostname.replace(/^www\\./, "");
-            if (hostname === "google.com" || hostname.endsWith(".google.com") || hostname === "gstatic.com") continue;
-          } catch { continue; }
-          if (seen.has(resultUrl)) continue;
-          seen.add(resultUrl);
-          addedThisPage++;
-          results.push({
-            rank: results.length + 1,
-            title: link.title,
-            url: resultUrl,
-            snippet: link.snippet.replace(link.title, '').trim().slice(0, 320),
-            source: "google"
-          });
-        }
-        if (addedThisPage === 0) break;
-      }
-      return results;
-    `;
-    return await kernelPlaywright(sessionId, code, 90);
-  }, { timeoutMs: 120_000, headless: false, useResidentialProxy: true });
-}
-
 /**
  * ============================================================================
  * IMPROVED SEARCH: PARALLEL + DEDUP + MERGE
@@ -1603,12 +1740,13 @@ function deduplicateResults(results: any[], targetCount: number): any[] {
 }
 
 export const searchWebTool = tool(
-  async ({ query, max_results }) => {
+  async ({ query, max_results, fetch_content }) => {
     try {
       const targetCount = boundedSearchResultCount(max_results);
 
-      // Check cache first
-      const cached = getCachedSearch(query);
+      // Check cache first (cache key includes whether content was fetched).
+      const cacheKey = fetch_content ? `${query} +content` : query;
+      const cached = getCachedSearch(cacheKey);
       if (cached) {
         console.log(`[search] cache hit for: ${query.slice(0, 60)}`);
         return JSON.stringify(cached.slice(0, targetCount));
@@ -1619,70 +1757,241 @@ export const searchWebTool = tool(
       // Brave freshness windows.
       const freshness = detectFreshness(query);
 
-      // Run fast API-based providers in parallel
-      const [youResults, braveResults, ddgResults, googleApiResults] = await Promise.allSettled([
-        searchViaYouCom(query, targetCount, { freshness }),
-        searchViaBrave(query, targetCount, { freshness }),
-        searchViaDuckDuckGo(query, targetCount),
-        searchGoogleCustomSearch(query, targetCount),
-      ]);
+      // Kick off ALL providers in parallel. Swallow rejections on each so a
+      // laggard we don't wait for can't surface as an unhandled rejection.
+      const youPromise = Promise.resolve(searchViaYouCom(query, targetCount, { freshness })).catch(() => null);
+      const bravePromise = Promise.resolve(searchViaBrave(query, targetCount, { freshness })).catch(() => null);
+      const ddgPromise = Promise.resolve(searchViaDuckDuckGo(query, targetCount)).catch(() => null);
+      const googlePromise = Promise.resolve(searchGoogleCustomSearch(query, targetCount)).catch(() => null);
 
-      // Collect all successful results, prioritizing by quality
-      const allResults: any[] = [];
+      let final: any[] = [];
 
-      // Priority 1: you.com (best snippets)
-      if (youResults.status === "fulfilled" && youResults.value) {
-        allResults.push(...youResults.value);
-      }
-      // Priority 2: Brave (good quality, fast)
-      if (braveResults.status === "fulfilled" && braveResults.value) {
-        allResults.push(...braveResults.value);
-      }
-      // Priority 3: Google Custom Search API
-      if (googleApiResults.status === "fulfilled" && googleApiResults.value) {
-        allResults.push(...googleApiResults.value);
-      }
-      // Priority 4: DuckDuckGo (no API key, always available)
-      if (ddgResults.status === "fulfilled" && ddgResults.value) {
-        allResults.push(...ddgResults.value);
-      }
-
-      // Deduplicate and take top results
-      if (allResults.length > 0) {
-        const final = deduplicateResults(allResults, targetCount);
-        setCachedSearch(query, final);
-        console.log(`[search] ${final.length} results for: ${query.slice(0, 60)} (sources: ${[...new Set(final.map(r => r.source))].join(", ")})`);
-        return JSON.stringify(final);
-      }
-
-      // Fallback: Google via Kernel stealth browser (slowest but most reliable)
-      console.log(`[search] all fast providers failed, falling back to Kernel browser for: ${query.slice(0, 60)}`);
-      const googleResults = await searchGoogleViaKernel(query, targetCount);
-      if (Array.isArray(googleResults) && googleResults.length > 0) {
-        const final = deduplicateResults(googleResults, targetCount);
-        setCachedSearch(query, final);
-        return JSON.stringify(final);
+      // Fast path: You.com is the paid priority provider with the best snippets.
+      // Await it FIRST and, if it already returns enough, use it immediately —
+      // don't block on the slower scrapers (DuckDuckGo HTML, Google pagination)
+      // which otherwise drag every search out to their 10-12s timeouts even when
+      // You.com answered in ~1s. The other promises keep running harmlessly.
+      const youFast = await youPromise;
+      if (Array.isArray(youFast) && youFast.length >= Math.min(targetCount, 5)) {
+        final = deduplicateResults(youFast, targetCount);
+        console.log(`[search] ${final.length} results for: ${query.slice(0, 60)} (you.com fast path)`);
+      } else {
+        // You.com was insufficient — wait for the rest (already running
+        // concurrently, so no latency beyond the slowest remaining one).
+        const [braveResults, ddgResults, googleApiResults] = await Promise.all([
+          bravePromise, ddgPromise, googlePromise,
+        ]);
+        const allResults: any[] = [];
+        if (youFast) allResults.push(...youFast);            // P1: you.com
+        if (braveResults) allResults.push(...braveResults);   // P2: Brave
+        if (googleApiResults) allResults.push(...googleApiResults); // P3: Google
+        if (ddgResults) allResults.push(...ddgResults);       // P4: DuckDuckGo
+        if (allResults.length > 0) {
+          final = deduplicateResults(allResults, targetCount);
+          console.log(`[search] ${final.length} results for: ${query.slice(0, 60)} (sources: ${[...new Set(final.map(r => r.source))].join(", ")})`);
+        }
       }
 
-      return JSON.stringify([{ rank: 1, title: "No results found", url: "", snippet: "Search returned no results for this query. Try different keywords or rephrase.", source: "none" }]);
+      if (final.length === 0) {
+        // No Kernel browser fallback here — search stays pure HTTP-API. Kernel
+        // is reserved for actual browser ACTIONS (browser_interact,
+        // sandbox_browser, browse_web's bot-wall escalation).
+        return JSON.stringify([{ rank: 1, title: "No results found", url: "", snippet: "Search returned no results for this query. Try different keywords or rephrase.", source: "none" }]);
+      }
+
+      // OPTIONAL CONTENT FETCH — the Grok-style "search + fetch in one shot".
+      // When fetch_content is set, batch-fetch the FULL page content of the top
+      // results in a SINGLE you.com Contents call (parallel server-side) and
+      // attach it to each result. This collapses search → browse → browse → …
+      // into ONE tool call so the model can answer from real page text without
+      // a separate round-trip per page.
+      if (fetch_content) {
+        const topUrls = final.map((r) => r.url).filter(Boolean).slice(0, 6);
+        const pages = await fetchManyViaYouContents(topUrls, 4000);
+        if (pages.length > 0) {
+          const byUrl = new Map(pages.map((p) => [p.url, p]));
+          // you.com may return a slightly normalized URL — match by hostname+path too.
+          const norm = (u: string) => { try { const x = new URL(u); return x.hostname.replace(/^www\./, "") + x.pathname.replace(/\/+$/, ""); } catch { return u; } };
+          const byNorm = new Map(pages.map((p) => [norm(p.url), p]));
+          let attached = 0;
+          for (const r of final) {
+            const hit = byUrl.get(r.url) ?? byNorm.get(norm(r.url));
+            if (hit?.markdown) { r.content = hit.markdown; attached += 1; }
+          }
+          console.log(`[search] fetched full content for ${attached}/${topUrls.length} top results.`);
+        }
+      }
+
+      setCachedSearch(cacheKey, final);
+      return JSON.stringify(final);
     } catch (e: any) {
       return `Failed to search web: ${e.message}`;
     }
   },
   {
     name: "search_web",
-    description: "Search the web using multiple providers in parallel (you.com, Brave, DuckDuckGo, Google). Returns deduplicated structured results with titles, URLs, and snippets. Fast and reliable.",
+    description:
+      "Search the web across multiple providers in parallel and return ranked results (title, URL, snippet). " +
+      "Set fetch_content=true to ALSO pull the full page text of the top results in the SAME call — use this whenever you need to READ the results, instead of calling browse_web on them one by one. " +
+      "One search_web(fetch_content=true) replaces a search followed by several browse_web calls.",
     schema: z.object({
       query: z.string().describe("The search query."),
       max_results: z.number().optional().describe("How many organic results to return. Defaults to 10; maximum 25."),
+      fetch_content: z.boolean().optional().describe("When true, also fetch the full page content (markdown) of the top ~6 results in one batch, attached as `content` on each result. Use for reading/answering; skip for a quick list of links."),
     }),
   }
 );
+
+function formatResearchResult(r: YouResearchResult): string {
+  const sources = r.sources
+    .filter((s) => s.url)
+    .slice(0, 15)
+    .map((s, i) => `[${i + 1}] ${s.title || s.url} — ${s.url}`)
+    .join("\n");
+  return [
+    "RESEARCH FINDINGS (gathered + synthesized from live web sources):",
+    r.content,
+    sources ? `\nSOURCES:\n${sources}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+export const researchTool = tool(
+  async ({ query, depth }) => {
+    try {
+      const effort = (["lite", "standard", "deep", "exhaustive"].includes(depth ?? "")
+        ? depth
+        : "standard") as "lite" | "standard" | "deep" | "exhaustive";
+      const result = await youResearch(query, effort, "research", detectFreshness(query));
+      if (!result) {
+        return "Research returned no answer. The provider may be unavailable — fall back to search_web + browse_web.";
+      }
+      return formatResearchResult(result);
+    } catch (e: any) {
+      return `Research failed: ${e?.message ?? e}. Fall back to search_web + browse_web.`;
+    }
+  },
+  {
+    name: "research",
+    description:
+      "Answer a knowledge/research question in ONE call: it searches the web, fetches and reads the relevant pages, and returns a synthesized, citation-backed summary of findings. " +
+      "Use this INSTEAD of chaining search_web + browse_web for fact-finding, 'what is the latest…', comparisons, explanations, and any question whose answer lives on the public web. " +
+      "It returns research FINDINGS for YOU to compose into your final reply in the user's language and voice — not a finished user-facing answer. " +
+      "Do NOT use for tasks that need browser actions (logins, clicks, downloads) or sandbox work — use sandbox_browser / browser_interact for those.",
+    schema: z.object({
+      query: z.string().min(3).describe("The question or research topic, stated in full."),
+      depth: z
+        .enum(["lite", "standard", "deep", "exhaustive"])
+        .optional()
+        .describe("Research effort. 'lite' for a quick fact (fastest), 'standard' (default) for most questions, 'deep'/'exhaustive' for multi-faceted reports (slower)."),
+    }),
+  }
+);
+
+export const financeResearchTool = tool(
+  async ({ query, depth }) => {
+    try {
+      const effort = (depth === "exhaustive" ? "exhaustive" : "deep") as "deep" | "exhaustive";
+      const result = await youResearch(query, effort, "finance_research");
+      if (!result) {
+        return "Finance research returned no answer. The provider may be unavailable — fall back to research or search_web.";
+      }
+      return formatResearchResult(result);
+    } catch (e: any) {
+      return `Finance research failed: ${e?.message ?? e}. Fall back to research or search_web.`;
+    }
+  },
+  {
+    name: "finance_research",
+    description:
+      "Deep financial research in ONE call: company financials, earnings, valuation, revenue drivers, market/sector analysis, comparisons of public companies. " +
+      "Searches financial sources, reads them, and returns a synthesized, citation-backed analysis for YOU to compose into your reply. " +
+      "Use for finance/markets/investing questions specifically; use `research` for general web questions. Not investment advice — present it as research.",
+    schema: z.object({
+      query: z.string().min(3).describe("The financial research question, stated in full (e.g. 'NVIDIA fiscal 2025 revenue drivers')."),
+      depth: z.enum(["deep", "exhaustive"]).optional().describe("Effort. 'deep' (default) or 'exhaustive' for the most thorough analysis (slower)."),
+    }),
+  }
+);
+
+/**
+ * Detects a bot-wall / verification interstitial in fetched content so we know
+ * a plain fetch was blocked rather than the page being genuinely empty.
+ */
+function looksBotWalled(title: string, text: string): boolean {
+  const blob = `${title ?? ""} ${text ?? ""}`.toLowerCase();
+  return /just a moment|verifying you are human|security verification|enable javascript|cloudflare|attention required|access denied|are you a robot|captcha/.test(blob)
+    || (typeof text === "string" && text.trim().length < 80);
+}
+
+/**
+ * Plain HTTP fetch + cheerio parse — NO browser. The cheap, fast default for
+ * read-only page reads. Returns null when the fetch fails or the page is
+ * bot-walled, so the caller can escalate to the Kernel stealth browser.
+ */
+async function fetchPageViaHttp(url: string, maxChars: number): Promise<any | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const ctype = response.headers.get("content-type") ?? "";
+  if (!response.ok || !/text\/html|application\/xhtml|text\/plain/i.test(ctype)) {
+    // Non-HTML (PDF/binary) or an error status — let the browser path handle it.
+    return null;
+  }
+
+  const html = await response.text();
+  const $ = cheerio.load(html);
+  $("script, style, noscript, svg").remove();
+
+  const c = (v: string | undefined | null, m = 500) =>
+    String(v ?? "").replace(/\s+/g, " ").trim().slice(0, m);
+
+  const title = c($("title").first().text(), 300);
+  const metaDescription = c($('meta[name="description"]').attr("content"), 500);
+  const headings = $("h1, h2, h3")
+    .map((_, el) => c($(el).text(), 180)).get()
+    .filter(Boolean).slice(0, 20);
+  const links = $("a[href]")
+    .map((_, el) => ({ text: c($(el).text() || $(el).attr("aria-label"), 160), url: $(el).attr("href") || "" })).get()
+    .filter((l) => l.text && /^https?:\/\//.test(l.url)).slice(0, 30);
+  const text = c($("body").text(), maxChars);
+
+  const snapshot = { url: response.url || url, title, metaDescription, headings, links, text };
+  return looksBotWalled(title, text) ? null : snapshot;
+}
 
 export const browseWebTool = tool(
   async ({ url, max_text_chars }) => {
     const maxChars = Math.max(1000, Math.min(20_000, max_text_chars ?? 7000));
 
+    // 1. you.com Contents API first — server-side fetch + clean markdown, no
+    // browser, defeats most light bot-walls. The primary path for reading a page.
+    const youContents = await fetchViaYouContents(url, maxChars);
+    if (youContents) {
+      return JSON.stringify({ url: youContents.url, title: youContents.title, text: youContents.markdown, source: "you.com:contents" });
+    }
+
+    // 2. Pure HTTP fetch — fast, no browser. For pages you.com couldn't return.
+    const httpResult = await fetchPageViaHttp(url, maxChars);
+    if (httpResult) return JSON.stringify(httpResult);
+
+    // 3. Kernel stealth browser — last resort for JS-heavy / hard bot-walls.
     const runBrowse = async (useResidentialProxy: boolean) =>
       withKernelBrowser(async (sessionId, session) => {
         const snapshot = await kernelPlaywright(sessionId, `
@@ -1745,13 +2054,45 @@ export const browseWebTool = tool(
   },
   {
     name: "browse_web",
-    description: "Fetch/read a page through a Kernel stealth browser and return the final URL, title, meta description, headings, useful links, and visible text.",
+    description: "Fetch/read a page and return the final URL, title, meta description, headings, useful links, and visible text. Uses a fast plain HTTP fetch first; only falls back to a stealth browser when the page is bot-walled or blocks the fetch.",
     schema: z.object({
       url: z.string().describe("The URL to visit."),
       max_text_chars: z.number().optional().describe("Maximum visible page text characters to return. Defaults to 7000; maximum 20000."),
     }),
   }
 );
+
+/**
+ * Read an image from the sandbox and describe/transcribe it with Cloudflare
+ * llama-3.2-vision. Tesseract OCR garbles text-heavy images (worksheets,
+ * fractions like "3/4", handwriting); a real multimodal model reads them
+ * accurately. Returns "" when vision is unavailable so callers fall back to OCR.
+ */
+async function describeImageWithVision(templateId: string, sandboxPath: string, question?: string): Promise<string> {
+  const acct = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  const key = process.env.CLOUDFLARE_API_KEY?.trim();
+  if (!acct || !key) return "";
+  try {
+    const bytes: Uint8Array = await runWithSandboxRetry(templateId, (liveSandbox) =>
+      liveSandbox.files.read(sandboxPath, { format: "bytes", requestTimeoutMs: 120_000 })
+    );
+    if (!bytes || bytes.byteLength === 0) return "";
+    const prompt = question
+      ? `${question}\n\nFirst transcribe ALL text in the image exactly as written — every number and fraction (write fractions with a slash, e.g. 3/4) in reading order — then use it to answer.`
+      : "Transcribe ALL text in this image exactly as written, including every number and fraction (write fractions with a slash, e.g. 3/4), in reading order top to bottom, left to right. Then briefly describe any non-text visual content.";
+    const url = `https://api.cloudflare.com/client/v4/accounts/${acct}/ai/run/@cf/meta/llama-3.2-11b-vision-instruct`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ image: Array.from(bytes), prompt, max_tokens: 1024 }),
+    });
+    const json: any = await resp.json().catch(() => null);
+    if (!resp.ok || !json?.result?.response) return "";
+    return String(json.result.response).trim();
+  } catch {
+    return "";
+  }
+}
 
 export const screenshotAnalyzeTool = tool(
   async ({ url, question, template_id }) => {
@@ -1767,30 +2108,46 @@ export const screenshotAnalyzeTool = tool(
       const localMatch = /^file:\/\/(.+)/.exec(url) || (url.startsWith("/home/user/") ? [url, url] : null);
       if (localMatch) {
         const localPath = localMatch[1];
+        // Vision FIRST: a multimodal model reads printed text, fractions ("3/4"),
+        // handwriting, and worksheet layouts FAR more reliably than tesseract,
+        // and it's the answer the model needs. Run OCR only as a backstop (one
+        // cheap pass) so the call stays fast — the old multi-PSM upscale loop ran
+        // up to 8 tesseract invocations and blew the agent's time budget.
+        const vision = await describeImageWithVision(templateId, localPath, question);
         const analysis = await runWithSandboxRetry(templateId, async (liveSandbox) => {
           const code = [
             "import json, os, subprocess",
             `p = ${JSON.stringify(localPath)}`,
             "if not os.path.exists(p): print(json.dumps({'error': 'file not found: ' + p})); raise SystemExit(0)",
             "info = subprocess.run(['file', p], capture_output=True, text=True).stdout.strip()",
-            "ocr = ''",
-            "try:",
-            "    r = subprocess.run(['tesseract', p, 'stdout', '-l', 'mya+eng'], capture_output=True, text=True, timeout=40)",
-            "    ocr = (r.stdout or '').strip()[:4000] or (r.stderr or '').strip()[:500]",
-            "except Exception as e:",
-            "    ocr = 'OCR error: ' + str(e)",
+            "dim = 'unknown'",
             "try:",
             "    from PIL import Image",
             "    dim = '{}x{}'.format(*Image.open(p).size)",
             "except Exception:",
-            "    dim = 'unknown'",
+            "    pass",
+            "ocr = ''",
+            "# Single quick OCR pass as a backstop (vision is primary). mya+eng then",
+            "# eng-only: the Myanmar pack may be missing, so a non-zero exit on the",
+            "# first attempt must NOT surface the tesseract error as 'OCR text'.",
+            "for _langs in ('eng', 'mya+eng'):",
+            "    try:",
+            "        r = subprocess.run(['tesseract', p, 'stdout', '-l', _langs, '--psm', '6'], capture_output=True, text=True, timeout=30)",
+            "        if r.returncode == 0 and (r.stdout or '').strip():",
+            "            ocr = r.stdout.strip()[:3000]; break",
+            "    except Exception:",
+            "        pass",
+            "if not ocr: ocr = '(no text extracted)'",
             "print(json.dumps({'path': p, 'fileInfo': info, 'dimensions': dim, 'ocrText': ocr, 'sizeBytes': os.path.getsize(p) if os.path.exists(p) else 0}, ensure_ascii=False))",
           ].join("\n");
-          const exec = await liveSandbox.commands.run(`python3 -c ${shellQuote(code)}`, { timeoutMs: 60_000, requestTimeoutMs: 60_000 });
+          const exec = await liveSandbox.commands.run(`python3 -c ${shellQuote(code)}`, { timeoutMs: 45_000, requestTimeoutMs: 45_000 });
           return exec.stdout?.trim() || exec.stderr?.trim() || "Image analysis produced no output.";
         });
         const questionContext = question ? `\nUser question: ${question}` : "";
-        return `Image analysis:\n${analysis}${questionContext}`;
+        if (vision) {
+          return `IMAGE READING (vision model — authoritative, use this):\n${vision}\n\n[Raw OCR backstop below — ignore if it conflicts with the reading above]\n${analysis}${questionContext}`;
+        }
+        return `Image analysis (OCR):\n${analysis}${questionContext}`;
       }
 
       // Take screenshot via Kernel browser, save to sandbox, analyze with Python (OCR/description)
@@ -2311,6 +2668,242 @@ export const sandboxBrowserTool = tool(
       actions: z.array(sandboxBrowserActionSchema).min(1).max(12).describe("Ordered actions to run. Up to 12 per call."),
       mobile: z.boolean().optional().describe("Use a mobile viewport + UA. Defaults to false."),
       reset_profile: z.boolean().optional().describe("Wipe the persistent profile before launching. Defaults to false."),
+      template_id: z.string().optional().describe(TEMPLATE_DESCRIPTIONS),
+    }),
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// PROGRAMMATIC TOOL CALLING (PTC) — run a sandbox script that calls Candle's
+// own tools over a file-based RPC bridge, so a multi-step pipeline collapses
+// into ONE tool turn with zero intermediate context cost.
+//
+// Transport: the sandbox script writes request files under
+// /home/user/.candle_rpc/req/<seq>.{json,done}; this host loop (running inside
+// the current session context) reads each request, dispatches to an allow-
+// listed tool via `.invoke()`, and writes /home/user/.candle_rpc/resp/<seq>.
+// {json,done}. NO new inbound network endpoint is opened. The session lock is
+// only held for individual filesystem ops — never across a dispatch — so the
+// dispatched sandbox tools can acquire it without deadlocking.
+// ────────────────────────────────────────────────────────────────────────────
+
+const PTC_RPC_ROOT = "/home/user/.candle_rpc";
+
+function ptcMaxRpcCalls(): number {
+  const parsed = Number(process.env.PTC_MAX_RPC_CALLS);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(1, Math.min(100, Math.floor(parsed)));
+}
+
+function ptcMaxWallMs(): number {
+  const parsed = Number(process.env.PTC_MAX_WALL_MS);
+  if (!Number.isFinite(parsed)) return 120_000;
+  return Math.max(15_000, Math.min(300_000, Math.floor(parsed)));
+}
+
+// Python preamble injected ABOVE the user's script. Defines the RPC helpers so
+// the model just calls search_web(...), read_file(...), etc. directly. No `${`
+// sequences here, so it is safe inside a TS template literal.
+const PTC_PYTHON_PREAMBLE = `import json, os, time
+_CANDLE_RPC = "${PTC_RPC_ROOT}"
+_CANDLE_SEQ = 0
+
+def _candle_call(tool, args):
+    global _CANDLE_SEQ
+    seq = _CANDLE_SEQ
+    _CANDLE_SEQ += 1
+    req_dir = os.path.join(_CANDLE_RPC, "req")
+    resp_dir = os.path.join(_CANDLE_RPC, "resp")
+    os.makedirs(req_dir, exist_ok=True)
+    os.makedirs(resp_dir, exist_ok=True)
+    with open(os.path.join(req_dir, str(seq) + ".json"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"tool": tool, "args": args}))
+    with open(os.path.join(req_dir, str(seq) + ".done"), "w", encoding="utf-8") as f:
+        f.write("1")
+    resp_json = os.path.join(resp_dir, str(seq) + ".json")
+    resp_done = os.path.join(resp_dir, str(seq) + ".done")
+    deadline = time.time() + 150
+    while time.time() < deadline:
+        if os.path.exists(resp_done):
+            with open(resp_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("error"):
+                raise RuntimeError("candle tool error: " + str(data["error"]))
+            return data.get("result")
+        time.sleep(0.1)
+    raise TimeoutError("candle tool call timed out: " + tool)
+
+def search_web(query, max_results=10):
+    return _candle_call("search_web", {"query": query, "max_results": max_results})
+
+def browse_web(url, max_text_chars=7000):
+    return _candle_call("browse_web", {"url": url, "max_text_chars": max_text_chars})
+
+def read_file(path, max_bytes=8000):
+    return _candle_call("read_file", {"path": path, "max_bytes": max_bytes})
+
+def write_file(path, content, encoding="text"):
+    return _candle_call("write_file", {"path": path, "content": content, "encoding": encoding})
+
+def list_files(path="/home/user"):
+    return _candle_call("list_files", {"path": path})
+
+def http_request(url, method="GET", headers=None, body=None):
+    return _candle_call("http_request", {"url": url, "method": method, "headers": headers, "body": body})
+`;
+
+const ptcSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Dispatch one RPC request to an allow-listed tool. Never throws. */
+async function ptcDispatch(toolName: string, args: any): Promise<{ result?: unknown; error?: string }> {
+  try {
+    const a = args ?? {};
+    let out: unknown;
+    switch (toolName) {
+      case "search_web":
+        out = await searchWebTool.invoke({ query: String(a.query ?? ""), max_results: a.max_results } as any);
+        break;
+      case "browse_web":
+        out = await browseWebTool.invoke({ url: String(a.url ?? ""), max_text_chars: a.max_text_chars } as any);
+        break;
+      case "read_file":
+        out = await readSandboxFileTool.invoke({ path: String(a.path ?? ""), max_bytes: a.max_bytes } as any);
+        break;
+      case "write_file":
+        out = await writeSandboxFileTool.invoke({ path: String(a.path ?? ""), content: String(a.content ?? ""), encoding: a.encoding } as any);
+        break;
+      case "list_files":
+        out = await listSandboxFilesTool.invoke({ path: String(a.path ?? "/home/user") } as any);
+        break;
+      case "http_request":
+        out = await httpRequestTool.invoke({ url: String(a.url ?? ""), method: a.method, headers: a.headers, body: a.body } as any);
+        break;
+      default:
+        return { error: `tool not allowed via RPC: ${toolName}` };
+    }
+    return { result: typeof out === "string" ? out.slice(0, 16_000) : out };
+  } catch (e: any) {
+    return { error: String(e?.message ?? e).slice(0, 2_000) };
+  }
+}
+
+export const runPythonWithToolsTool = tool(
+  async ({ code, template_id }) => {
+    const templateId = selectTemplateForTask("python", code, template_id);
+    const maxCalls = ptcMaxRpcCalls();
+    const maxWallMs = ptcMaxWallMs();
+    const fullScript = `${PTC_PYTHON_PREAMBLE}\n\n# ===== user script =====\n${code}`;
+    const scriptPath = `/home/user/candle_ptc_${Date.now()}.py`;
+    const reqDir = `${PTC_RPC_ROOT}/req`;
+    const respDir = `${PTC_RPC_ROOT}/resp`;
+
+    let handle: any;
+    try {
+      // Fresh RPC dirs + script, then launch the script in the background.
+      await runWithSandboxRetry(templateId, async (sb: any) => {
+        await sb.commands.run(`rm -rf ${PTC_RPC_ROOT} && mkdir -p ${reqDir} ${respDir}`, {
+          timeoutMs: 30_000,
+          requestTimeoutMs: 30_000,
+        });
+        await sb.files.write(scriptPath, fullScript, { requestTimeoutMs: 60_000 });
+      });
+      handle = await runWithSandboxRetry(templateId, (sb: any) =>
+        sb.commands.run(`python3 ${scriptPath}`, {
+          background: true,
+          timeoutMs: maxWallMs,
+          requestTimeoutMs: 30_000,
+        })
+      );
+    } catch (e: any) {
+      return formatCommandError(e, "Programmatic execution (startup)");
+    }
+
+    let done = false;
+    let result: any = null;
+    let err: any = null;
+    const waitPromise = handle
+      .wait()
+      .then((r: any) => { result = r; done = true; })
+      .catch((e: any) => { err = e; done = true; });
+
+    let seq = 0;
+    let rpcCalls = 0;
+    const deadline = Date.now() + maxWallMs;
+
+    while (!done && Date.now() < deadline) {
+      let entries: any[] = [];
+      try {
+        entries = await runWithSandboxRetry(templateId, (sb: any) => sb.files.list(reqDir, { requestTimeoutMs: 15_000 }));
+      } catch {
+        entries = [];
+      }
+      const hasNext = entries.some((e: any) => e?.name === `${seq}.done`);
+      if (!hasNext) {
+        await ptcSleep(200);
+        continue;
+      }
+
+      rpcCalls += 1;
+      let reqData: any = null;
+      try {
+        const raw = await runWithSandboxRetry(templateId, (sb: any) => sb.files.read(`${reqDir}/${seq}.json`, { requestTimeoutMs: 15_000 }));
+        reqData = JSON.parse(typeof raw === "string" ? raw : String(raw));
+      } catch {
+        reqData = null;
+      }
+
+      let respObj: { result?: unknown; error?: string };
+      if (rpcCalls > maxCalls) {
+        respObj = { error: `RPC call limit (${maxCalls}) reached — stop calling candle tools and finish the script.` };
+      } else if (!reqData || typeof reqData.tool !== "string") {
+        respObj = { error: "malformed RPC request" };
+      } else {
+        respObj = await ptcDispatch(reqData.tool, reqData.args);
+      }
+
+      try {
+        await runWithSandboxRetry(templateId, async (sb: any) => {
+          await sb.files.write(`${respDir}/${seq}.json`, JSON.stringify(respObj), { requestTimeoutMs: 30_000 });
+          await sb.files.write(`${respDir}/${seq}.done`, "1", { requestTimeoutMs: 15_000 });
+        });
+      } catch {
+        // If we can't deliver the response the script will time out on its own.
+      }
+      seq += 1;
+    }
+
+    if (!done) {
+      try { await handle.kill(); } catch { /* already gone */ }
+      await Promise.race([waitPromise, ptcSleep(2_000)]);
+    }
+
+    const footer = `\n\n[${rpcCalls} tool call(s) made via RPC${rpcCalls > maxCalls ? `, limit ${maxCalls} hit` : ""}]`;
+    if (err) {
+      return redactSecrets(formatCommandError(err, "Programmatic execution") + footer);
+    }
+    if (result) {
+      const stdout = (result.stdout ?? "").toString().trim();
+      const stderr = (result.stderr ?? "").toString().trim();
+      const body = [stdout ? `stdout:\n${stdout}` : "", stderr ? `stderr:\n${stderr}` : ""]
+        .filter(Boolean)
+        .join("\n\n") || "Script finished with no output.";
+      return redactSecrets(body + footer);
+    }
+    return redactSecrets(`Programmatic execution timed out after ${Math.round(maxWallMs / 1000)}s and was killed.${footer}`);
+  },
+  {
+    name: "run_python_with_tools",
+    description:
+      "Run a Python script in the sandbox that can call Candle's OWN tools as plain functions, so a whole multi-step pipeline runs as ONE turn with no intermediate context cost. " +
+      "Available functions (call them directly — no import needed): " +
+      "search_web(query, max_results=10), browse_web(url, max_text_chars=7000), read_file(path, max_bytes=8000), " +
+      "write_file(path, content, encoding='text'), list_files(path='/home/user'), http_request(url, method='GET', headers=None, body=None). " +
+      "Each returns the tool's raw string output; parse it in Python as needed. " +
+      "Use this for loops over many items (e.g. search 10 queries and write a combined report) where calling tools one-by-one would flood the conversation. " +
+      "print() whatever you want returned to you — only stdout comes back. " +
+      `Hard caps: ${ptcMaxRpcCalls()} tool calls and ${Math.round(ptcMaxWallMs() / 1000)}s wall-clock per script.`,
+    schema: z.object({
+      code: z.string().describe("Python script body. Call search_web/read_file/write_file/etc. directly; print() the final result."),
       template_id: z.string().optional().describe(TEMPLATE_DESCRIPTIONS),
     }),
   }

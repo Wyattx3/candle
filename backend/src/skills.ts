@@ -46,7 +46,7 @@ const SKILL_FILE_BASENAME = "SKILL.md";
 const NAME_REGEX = /^[a-z0-9][a-z0-9-]{1,62}$/;
 const MAX_BODY_CHARS = 16_000;
 const MAX_DESCRIPTION_CHARS = 200;
-const MAX_INDEX_LINES = 60;
+const MAX_INDEX_LINES = 120;
 
 let cache: Skill[] | null = null;
 

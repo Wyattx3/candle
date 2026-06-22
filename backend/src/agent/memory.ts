@@ -18,6 +18,15 @@ export interface MemoryEntry {
 const MEMORY_FILE = path.resolve(__dirname, "../../.candle_memory.json");
 
 /**
+ * Reserved key for the periodically-synthesized user profile (see
+ * `memory-synthesis.ts`). It holds ONE coherent paragraph distilled from the
+ * scattered user_preference / project_fact entries, and is surfaced at the top
+ * of `getSummary()` so the model starts every turn with a "who is this user"
+ * picture instead of disconnected facts.
+ */
+export const USER_PROFILE_KEY = "user_profile";
+
+/**
  * Maximum entries kept on disk. When exceeded, the least-recently-accessed
  * entries are evicted on the next save. Keeps the JSON file from growing
  * unboundedly across months of use. Override with `MEMORY_MAX_ENTRIES` env.
@@ -146,19 +155,32 @@ export class PersistentMemoryStore {
   }
 
   public getSummary(): string {
+    const profile = this.entries.find((e) => e.key === USER_PROFILE_KEY);
+
+    // The synthesized profile is one coherent paragraph — show it FIRST and
+    // exclude it from the raw-fact list (it's already distilled from them).
     const recent = [...this.entries]
+      .filter((e) => e.key !== USER_PROFILE_KEY)
       .sort((a, b) => b.accessedAt - a.accessedAt)
       .slice(0, 10);
-    
-    if (recent.length === 0) return "";
 
-    const lines = recent.map(r => `- [${r.category}] ${r.key}: ${r.value}`);
-    return (
-      `## PERSISTENT MEMORY (Top 10 recent facts)\n` +
-      `These are facts you have learned and remembered about the user or projects:\n` +
-      `${lines.join("\n")}\n\n` +
-      `Use the \`search_memory\` tool to find more specific details if needed.`
-    );
+    if (!profile && recent.length === 0) return "";
+
+    let out = "";
+    if (profile) {
+      out +=
+        `## WHO YOU'RE WORKING WITH\n` +
+        `${profile.value}\n\n`;
+    }
+    if (recent.length > 0) {
+      const lines = recent.map((r) => `- [${r.category}] ${r.key}: ${r.value}`);
+      out +=
+        `## PERSISTENT MEMORY (recent facts)\n` +
+        `Facts you have learned and remembered about the user or projects:\n` +
+        `${lines.join("\n")}\n\n`;
+    }
+    out += `Use the \`search_memory\` tool to find more specific details if needed.`;
+    return out;
   }
 }
 

@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-06-20T20-36-35-321Z",
+  "split": "validation",
+  "level": "all",
+  "model": "@cf/zai-org/glm-5.2",
+  "pass": 2,
+  "total": 4,
+  "passRate": 0.5,
+  "byLevel": {
+    "L1": {
+      "pass": 2,
+      "total": 4
+    }
+  },
+  "errors": 1
+}

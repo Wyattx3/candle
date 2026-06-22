@@ -19,14 +19,21 @@ import { backoffMs, classifyLlmError, LlmErrorClassification } from "../llm-erro
 import { scanForThreats, summarizeThreats } from "../security";
 import {
   agentLLM,
+  agentLLMLow,
   noToolsLLM,
   parentTools,
   pickFailoverLLM,
   researchLLM,
+  researchLLMLow,
   subagentLLM,
+  subagentLLMLow,
   subagentResearchLLM,
+  subagentResearchLLMLow,
   subagentTools,
   FAILOVER_AVAILABLE,
+  getLlmTimeoutMs,
+  getLlmReasoningCommitMs,
+  getLlmCommitDeadlineMs,
 } from "./llm";
 import { isResearchQuery } from "./budget";
 import {
@@ -36,15 +43,19 @@ import {
   extractSearchResults,
 } from "./helpers";
 import {
-  containsHermesToolTokens,
-  parseHermesToolCalls,
-  stripHermesToolTokens,
-} from "./hermes-tokens";
+  containsToolCallTokens,
+  extractToolCallsFromText,
+  stripToolCallTokens,
+} from "./tool-call-recovery";
 import { containsInlineReasoning, extractInlineReasoning } from "./reasoning";
+import { isDegenerateText } from "./degeneration";
 import { sanitizeMessagesSurrogates } from "./message-sanitization";
+import { coerceToolArgs } from "./tool-arg-coercion";
 import { compressToolResults, compressionSavings } from "./context-compressor";
 import { describeError } from "./error-diag";
+import { extractStructuredReasoning } from "./reasoning";
 import { getTodoStore } from "./todo";
+import { explainEmptyFinal } from "./turn-explainer";
 
 /**
  * Token threshold at which the loop prunes old tool outputs. Defaults to a
@@ -60,28 +71,521 @@ import { RunContext } from "./run-context";
 import { AgentAbortError } from "./types";
 
 
+/**
+ * True when a salvaged partial message carries something we can actually use —
+ * either visible answer text or at least one COMPLETE tool call. An interrupted
+ * generation with only a half-streamed tool call (no text) is NOT usable.
+ */
+export function hasUsableContent(msg: any): boolean {
+  if (!msg) return false;
+  const text = contentToText(msg.content).trim();
+  if (text.length > 0) return true;
+  const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+  return calls.length > 0;
+}
+
+/**
+ * Drop a trailing tool call whose arguments never finished streaming. When a
+ * timeout interrupts mid-call the args JSON is truncated/unparseable; executing
+ * it would error or do the wrong thing. We keep every COMPLETE call and discard
+ * only the dangling one. A call is considered complete if it has a name and its
+ * args are a non-null object (LangChain parses streamed args into `.args`; a
+ * still-incomplete call leaves `.args` undefined/empty while raw fragments live
+ * in `tool_call_chunks`).
+ */
+export function dropIncompleteToolCall(msg: any): any {
+  const calls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+  if (calls.length === 0) return msg;
+  const complete = calls.filter(
+    (c: any) => c && typeof c.name === "string" && c.name.length > 0 && c.args != null && typeof c.args === "object"
+  );
+  if (complete.length === calls.length) return msg;
+  // Mutate a shallow copy so we never alter the accumulated chunk in place.
+  return Object.assign(Object.create(Object.getPrototypeOf(msg)), msg, { tool_calls: complete });
+}
+
+/**
+ * Invoke an LLM with a per-call wall-clock guard, STREAMING the generation so a
+ * timeout can SALVAGE whatever was produced instead of discarding it.
+ *
+ * This is the OpenCode / Hermes pattern: those agents consume the model via the
+ * Vercel AI SDK `streamText` (token streaming + abortSignal), so a long or
+ * aborted generation keeps its partial text and any completed tool calls. Our
+ * previous `llm.invoke()` did the opposite — a per-call timeout threw away EVERY
+ * token the model had already emitted, which is the literal cause of the GAIA
+ * "0 tools, 300s, empty answer" rumination spiral (the model WAS generating; we
+ * just discarded it on timeout).
+ *
+ * Behaviour:
+ *  - Stream chunks and accumulate them (`AIMessageChunk.concat`).
+ *  - On a per-call TIMEOUT: stop reading and RETURN the accumulated partial if
+ *    it has usable content (text or a complete tool call), after dropping any
+ *    half-streamed trailing call. Only throw the retryable `TimeoutError` when
+ *    nothing usable was produced — preserving the existing retry / low-effort /
+ *    forced-commit recovery path for the truly-empty case.
+ *  - A run-level abort (user cancel / run timeout) always bubbles up as a real
+ *    cancel, never a salvage.
+ *  - If the provider/binding can't stream, fall back to a single `.invoke()`.
+ */
+export async function invokeOnceWithTimeout(
+  llm: {
+    invoke: (msgs: any[], options?: any) => Promise<any>;
+    stream?: (msgs: any[], options?: any) => Promise<AsyncIterable<any>>;
+  },
+  messages: any[],
+  runSignal?: AbortSignal,
+  timeoutMs = getLlmTimeoutMs(),
+  /**
+   * Reasoning cap (ms). When > 0, a generation that has streamed ONLY reasoning
+   * tokens (no visible content, no tool-call-arg fragments) for this long is
+   * aborted as a runaway "rumination" turn. The accumulated reasoning is
+   * discarded and a `ReasoningCapError` is thrown so the caller can force a
+   * fast no-tools commit. This is the real fix for GAIA `timeout_0_tools`: the
+   * model was getting stuck in one 94-250s reasoning-only generation that never
+   * committed to a tool call or answer, so the run-level timeout fired and
+   * emitted a garbage placeholder. 0 disables the cap (used by the commit call
+   * itself, which must be allowed to finish).
+   */
+  reasoningCapMs = 0,
+  /**
+   * No-commit guard (ms). When > 0, a generation that has streamed for this long
+   * WITHOUT producing a real commitment — a complete tool call OR a substantial
+   * answer (past `COMMIT_CONTENT_FLOOR` chars) — is aborted with a
+   * `NoCommitError`. This catches the SLOW-DRIBBLE runaway that defeats the
+   * reasoning cap: the model emits occasional content tokens (which reset the
+   * reasoning clock) yet never commits to a tool call or a complete answer,
+   * burning the whole run. Unlike the reasoning cap, dribbled content does NOT
+   * satisfy this guard — only an actual commitment does. 0 disables it.
+   */
+  commitDeadlineMs = 0
+): Promise<any> {
+  const controller = new AbortController();
+  let timedOut = false;
+  let reasoningCapped = false;
+  let noCommit = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onRunAbort = () => controller.abort();
+  runSignal?.addEventListener("abort", onRunAbort);
+
+  // Reasoning-cap watchdog (anti-rumination). Tracks the last time the stream
+  // produced REAL output (content or tool-call args). While the model only
+  // emits reasoning tokens, that clock does not advance; once the gap exceeds
+  // reasoningCapMs the turn is treated as a runaway and aborted so the loop can
+  // force a commit. Healthy turns that emit content/tool-args (even after a long
+  // think) reset the clock and are never capped.
+  //
+  // No-commit guard (anti-dribble). Tracks wall-clock since the stream started.
+  // It is satisfied ONLY by a real commitment (`hasCommitted`) — a complete tool
+  // call or a substantial answer. Dribbled content does NOT reset it, so it
+  // catches the slow-dribble runaway the reasoning cap cannot.
+  let lastRealOutputAt = Date.now();
+  const streamStartedAt = Date.now();
+  let sawReasoning = false;
+  let hasCommitted = false;
+  let watchdog: ReturnType<typeof setInterval> | undefined;
+  if (reasoningCapMs > 0 || commitDeadlineMs > 0) {
+    const tick = Math.min(...[reasoningCapMs, commitDeadlineMs, 5_000].filter((n) => n > 0));
+    watchdog = setInterval(() => {
+      if (reasoningCapMs > 0 && sawReasoning && Date.now() - lastRealOutputAt >= reasoningCapMs) {
+        reasoningCapped = true;
+        controller.abort();
+        return;
+      }
+      if (commitDeadlineMs > 0 && !hasCommitted && Date.now() - streamStartedAt >= commitDeadlineMs) {
+        noCommit = true;
+        controller.abort();
+      }
+    }, tick);
+  }
+
+  const makeTimeoutError = () => {
+    const e = new Error(`LLM call exceeded ${Math.round(timeoutMs / 1000)}s — aborted in-flight generation.`);
+    e.name = "TimeoutError";
+    return e;
+  };
+  const makeReasoningCapError = () => {
+    const e = new Error(
+      `LLM streamed only reasoning for ${Math.round(reasoningCapMs / 1000)}s without committing to ` +
+      `a tool call or answer — aborted runaway reasoning to force a commit.`
+    );
+    e.name = "ReasoningCapError";
+    return e;
+  };
+  const makeNoCommitError = () => {
+    const e = new Error(
+      `LLM streamed for ${Math.round(commitDeadlineMs / 1000)}s without committing to a tool call ` +
+      `or a substantial answer — aborted slow-dribble runaway to force action.`
+    );
+    e.name = "NoCommitError";
+    return e;
+  };
+
+  try {
+    // Non-streaming fallback when the binding doesn't expose `.stream`.
+    if (typeof llm.stream !== "function") {
+      try {
+        return await llm.invoke(messages, { signal: controller.signal });
+      } catch (error: any) {
+        if (timedOut && !runSignal?.aborted) throw makeTimeoutError();
+        throw error;
+      }
+    }
+
+    let accumulated: any = undefined;
+    try {
+      const stream = await llm.stream(messages, { signal: controller.signal });
+      for await (const chunk of stream) {
+        const before = accumulated;
+        accumulated = accumulated === undefined ? chunk : accumulated.concat(chunk);
+        if (reasoningCapMs > 0) {
+          // Real output (content or tool-call args) advances the commit clock;
+          // reasoning-only chunks merely mark that the model is thinking.
+          if (chunkHasRealOutput(chunk, before, accumulated)) {
+            lastRealOutputAt = Date.now();
+          } else if (chunkHasReasoning(chunk)) {
+            sawReasoning = true;
+          }
+        }
+        // No-commit guard: latch once the turn has produced a REAL commitment.
+        // Dribbled content alone does not count — only a complete tool call or a
+        // substantial answer (past the content floor) satisfies it.
+        if (commitDeadlineMs > 0 && !hasCommitted && hasCommitment(accumulated)) {
+          hasCommitted = true;
+        }
+      }
+      // Stream finished cleanly — return the fully-accumulated message.
+      return accumulated;
+    } catch (error: any) {
+      // No-commit guard fired (slow-dribble runaway): salvage anything usable,
+      // else throw NoCommitError so the caller forces the action-oriented retry.
+      if (noCommit && !runSignal?.aborted) {
+        // Only salvage if what streamed is a REAL commitment (a complete tool
+        // call or a substantial answer). Trivial dribble — the very thing the
+        // guard exists to reject — must NOT be returned as an answer; throw so
+        // the caller forces the action-oriented retry.
+        const salvaged = accumulated ? dropIncompleteToolCall(accumulated) : undefined;
+        if (salvaged && hasCommitment(salvaged)) {
+          console.warn(
+            `[model:stream] no-commit guard after ${Math.round(commitDeadlineMs / 1000)}s — ` +
+            `salvaged committed output (${contentToText(salvaged.content).length} chars).`
+          );
+          return salvaged;
+        }
+        console.warn(
+          `[model:stream] no-commit guard after ${Math.round(commitDeadlineMs / 1000)}s — ` +
+          `dribble with no committed tool call or answer; forcing action.`
+        );
+        throw makeNoCommitError();
+      }
+      // Reasoning cap fired (runaway rumination): abort and signal the caller to
+      // force a commit. Salvage any usable partial first — but a capped turn by
+      // definition produced no real output, so this is almost always a throw.
+      if (reasoningCapped && !runSignal?.aborted) {
+        const salvaged = accumulated ? dropIncompleteToolCall(accumulated) : undefined;
+        if (hasUsableContent(salvaged)) {
+          console.warn(
+            `[model:stream] reasoning cap after ${Math.round(reasoningCapMs / 1000)}s — ` +
+            `salvaged partial output (${contentToText(salvaged.content).length} chars).`
+          );
+          return salvaged;
+        }
+        console.warn(
+          `[model:stream] reasoning cap after ${Math.round(reasoningCapMs / 1000)}s — ` +
+          `runaway reasoning with no committed output; forcing a commit.`
+        );
+        throw makeReasoningCapError();
+      }
+      // Per-call timeout (NOT a run-level/user abort): try to salvage the
+      // partial generation before falling back to a retryable timeout.
+      if (timedOut && !runSignal?.aborted) {
+        const salvaged = accumulated ? dropIncompleteToolCall(accumulated) : undefined;
+        if (hasUsableContent(salvaged)) {
+          console.warn(
+            `[model:stream] per-call timeout after ${Math.round(timeoutMs / 1000)}s — ` +
+            `salvaged partial output (${contentToText(salvaged.content).length} chars, ` +
+            `${(salvaged.tool_calls?.length ?? 0)} complete tool call(s)).`
+          );
+          return salvaged;
+        }
+        throw makeTimeoutError();
+      }
+      throw error;
+    }
+  } finally {
+    clearTimeout(timer);
+    if (watchdog) clearInterval(watchdog);
+    runSignal?.removeEventListener("abort", onRunAbort);
+  }
+}
+
+/**
+ * Content-length floor (chars) past which an answer-only turn counts as a real
+ * commitment for the no-commit guard. A slow-dribble runaway produces only a
+ * trickle over a long time and never crosses this; a genuine answer does.
+ */
+const COMMIT_CONTENT_FLOOR = 400;
+
+/**
+ * True when the accumulated message represents a real commitment — at least one
+ * (in-progress or complete) tool call, OR a substantial answer past the content
+ * floor. Used by the no-commit guard so dribbled fragments don't masquerade as
+ * progress.
+ */
+function hasCommitment(accumulated: any): boolean {
+  if (!accumulated) return false;
+  const tc = accumulated.tool_calls;
+  if (Array.isArray(tc) && tc.length > 0) return true;
+  const tcc = accumulated.tool_call_chunks;
+  if (Array.isArray(tcc) && tcc.length > 0) return true;
+  return contentToText(accumulated.content).length >= COMMIT_CONTENT_FLOOR;
+}
+
+/** True when a chunk carried native reasoning/thinking tokens. */
+function chunkHasReasoning(chunk: any): boolean {
+  try {
+    return extractStructuredReasoning(chunk).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a streamed chunk produced REAL output — visible answer text or
+ * tool-call-arg fragments. Reasoning/thinking tokens are deliberately NOT real
+ * output: a turn that only ever reasons is the runaway the reasoning cap exists
+ * to break. Keepalive/usage-only chunks also return false.
+ */
+function chunkHasRealOutput(chunk: any, before: any, after: any): boolean {
+  // New tool-call-arg fragments streamed in this chunk.
+  const tcc = chunk?.tool_call_chunks;
+  if (Array.isArray(tcc) && tcc.length > 0) return true;
+  // Chunk carried visible answer text.
+  if (contentToText(chunk?.content).length > 0) return true;
+  // Fallback: total accumulated text grew vs. the previous accumulation.
+  if (before !== undefined && after !== undefined) {
+    if (contentToText(after.content).length > contentToText(before.content).length) return true;
+  }
+  return false;
+}
+
+/**
+ * Per-attempt timeout budget. A pure-reasoning final answer (a hard logic/math
+ * puzzle with no tools) legitimately needs a long single generation — GLM-5.2
+ * at reasoning_effort=medium can run well past the standard timeout. So the
+ * FIRST attempt gets a generous budget: 1.5× the standard, but FLOORED at 150s
+ * and capped at 180s. The floor matters — with the default 75s base, 1.5× is
+ * only 112.5s, which cut legitimate 106-134s reasoning generations right at the
+ * boundary; the timeout then dropped the retry to LOW reasoning effort, which
+ * cannot crack a hard puzzle, and the run spiralled to an empty 235s timeout
+ * (the 50ec8903 Rubik's-edge failure). Once the first attempt times out,
+ * `invokeWithRetry` injects a concise-commit directive and the retry falls back
+ * to the tight standard timeout. The 180s cap stays well under the run budget
+ * (default 300s) so first-attempt + one retry still leaves margin for the
+ * run-level forced answer instead of eating the whole budget.
+ */
+function firstAttemptTimeoutMs(): number {
+  return Math.max(150_000, Math.min(Math.floor(getLlmTimeoutMs() * 1.5), 180_000));
+}
+
+// Deadline-aware retry tuning. The root cause of the GAIA "0 tools, 300s, empty"
+// failure was a single model turn eating the whole run: firstAttempt (≤180s) +
+// retry (75s) + retry (75s) = 270s, after which the run-level timeout killed the
+// run before the soft-deadline forced-answer node could fire. We now clamp every
+// attempt to the time left before the soft deadline and, when too little time
+// remains for a real generation, do ONE fast no-tools commit so the user always
+// gets an answer.
+const DEADLINE_COMMIT_MARGIN_MS = 12_000; // below this much remaining → forced commit
+const DEADLINE_SAFETY_MS = 5_000;         // reserve so the graph can still wrap up
+const MIN_ATTEMPT_TIMEOUT_MS = 12_000;    // floor so a clamped attempt is still usable
+// Forced-commit window. The soft deadline sits at 80% of the run timeout, so when
+// the forced commit fires there is still ~20% of the run (≈60s at 300s) before the
+// HARD timeout. The old code capped this commit at MIN_ATTEMPT_TIMEOUT_MS (12s) and
+// let the model keep reasoning — on a pure-reasoning task it re-reasoned, timed out,
+// and returned BLANK (→ the explainer placeholder). Give the commit a real budget
+// (the run signal still bounds it) and a no-re-reason directive so ~200s of thinking
+// already in context becomes a scored answer instead of being thrown away.
+const COMMIT_TIMEOUT_MS = 50_000;
+
+/**
+ * Last-ditch answer when the run is about to hit its soft deadline. Forces a
+ * SHORT, no-tools completion so a long rumination spiral can't end the run with
+ * an empty/timeout placeholder. Tight timeout — this is a commit, not a
+ * full generation.
+ */
+async function forcedDeadlineCommit(messages: any[], signal?: AbortSignal): Promise<any> {
+  console.warn("[model:retry] soft deadline reached — forcing a commit answer from work already done.");
+  const commitMsg = {
+    role: "system" as const,
+    content:
+      "⏱️ STOP. You are out of time. You have ALREADY done the thinking above — do NOT re-derive, " +
+      "re-check, or reason any further. Read back over your own work above and WRITE THE ANSWER NOW. " +
+      "Do NOT call any tools. Keep it to 1-3 sentences.\n" +
+      "If this is a benchmark task, your reply MUST end with the required `FINAL ANSWER: <answer>` line — " +
+      "give your single best answer even if you are not fully certain; a guess can score, a blank never does.",
+  };
+  // Use a real commit window (not the 12s floor) — the run-level signal still
+  // bounds it, but on a pure-reasoning task the model needs more than 12s to
+  // restate a multi-step answer without timing out blank.
+  return invokeOnceWithTimeout(noToolsLLM, [...messages, commitMsg], signal, COMMIT_TIMEOUT_MS);
+}
+
 export async function invokeWithRetry(
   messages: any[],
   signal?: AbortSignal,
   maxRetries = 3,
-  llm: { invoke: (msgs: any[]) => Promise<any> } = agentLLM
+  llm: { invoke: (msgs: any[], options?: any) => Promise<any> } = agentLLM,
+  lowEffortLlm?: { invoke: (msgs: any[], options?: any) => Promise<any> },
+  /**
+   * Absolute epoch-ms soft deadline for the WHOLE run (runCtx.softDeadlineAt).
+   * When set, each attempt's per-call timeout is clamped to the time left so a
+   * single turn can never eat the whole run budget, and a near-deadline turn
+   * collapses to a fast no-tools commit instead of timing out empty.
+   */
+  deadlineAt?: number | null
 ): Promise<any> {
   let lastError: any;
   let lastClassification: LlmErrorClassification | undefined;
+  // Recovery payload — starts as the caller's messages but may be replaced by
+  // an emergency-compressed copy after a context-overflow. Subsequent retries
+  // and the failover attempt all use the smaller payload.
+  let currentMessages = messages;
+  // The LLM used for the current attempt. A timeout swaps it to the low-effort
+  // sibling (if provided) so the retry stops ruminating and commits to acting.
+  let currentLlm = llm;
+  // One-shot guard: emergency context compression fires at most once per call,
+  // so a still-too-big payload can't loop the recovery forever.
+  let contextRecoveryDone = false;
+  // One-shot guard: the concise-commit directive is injected at most once after
+  // a timeout, so subsequent retries reuse it instead of stacking duplicates.
+  let timeoutRecoveryInjected = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     if (signal?.aborted) throw new AgentAbortError();
+
+    // First attempt gets a generous timeout so a legitimately long
+    // pure-reasoning generation can finish; retries fall back to the tight
+    // standard timeout (by then the concise-commit directive is in play).
+    const baseTimeout = attempt === 0 ? firstAttemptTimeoutMs() : getLlmTimeoutMs();
+    let attemptTimeout = baseTimeout;
+    // Deadline-aware clamp: never let a single attempt run past the run's soft
+    // deadline. When too little time remains for a real generation, commit now.
+    if (deadlineAt != null) {
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= DEADLINE_COMMIT_MARGIN_MS) {
+        return await forcedDeadlineCommit(currentMessages, signal);
+      }
+      attemptTimeout = Math.max(MIN_ATTEMPT_TIMEOUT_MS, Math.min(baseTimeout, remaining - DEADLINE_SAFETY_MS));
+    }
+
     try {
-      return await llm.invoke(messages);
+      // Apply the reasoning cap on the FIRST attempt only (it counts native
+      // reasoning tokens and resets on real output, so it never cuts a healthy
+      // think on providers that stream reasoning as content).
+      //
+      // The per-generation no-commit guard is DISABLED (commitMs=0): checkpoint
+      // forensics proved the 0-tool runaways are pure-reasoning puzzles whose
+      // LEGITIMATE successes take 123-165s, while runaways die at the 240s run
+      // timeout. The runaway is therefore a RUN-LEVEL phenomenon spanning multiple
+      // attempts — invisible to any per-generation watchdog, and a 60s per-attempt
+      // commit cut would destroy the legit 123-165s successes. It's handled at the
+      // run level instead (raised first-attempt timeout + forcedDeadlineCommit that
+      // commits from accumulated reasoning instead of re-reasoning into a blank).
+      const capMs = attempt === 0 ? getLlmReasoningCommitMs() : 0;
+      const commitMs = 0;
+      return await invokeOnceWithTimeout(currentLlm, currentMessages, signal, attemptTimeout, capMs, commitMs);
     } catch (error: any) {
-      // Abort/timeout — never retry or failover; bubble up immediately so the
-      // run ends cleanly instead of burning a retry on a cancelled signal.
-      if (signal?.aborted || error?.name === "AbortError" || error instanceof AgentAbortError) {
+      // Run-level abort (run timeout or user cancel) — never retry or failover;
+      // bubble up immediately so the run ends cleanly. A per-call timeout is NOT
+      // caught here: invokeOnceWithTimeout rethrew it as a retryable TimeoutError.
+      if (signal?.aborted || error instanceof AgentAbortError) {
         throw new AgentAbortError();
       }
-      lastError = error;
-      lastClassification = classifyLlmError(error);
+      // Reasoning cap fired: the model streamed only reasoning without committing
+      // to a tool call or answer (the GAIA `timeout_0_tools` runaway). Retrying
+      // the identical request just hits the same wall, so force a fast no-tools
+      // commit NOW from what context exists — this is exactly the fix that keeps
+      // the run from dying at the run-level timeout with an empty placeholder.
+      if (error?.name === "ReasoningCapError") {
+        console.warn("[model:retry] reasoning cap fired — forcing a no-tools commit instead of re-running the runaway.");
+        return await forcedDeadlineCommit(currentMessages, signal);
+      }
+      // No-commit guard fired: the model dribbled content for too long without
+      // committing to a tool call or a real answer. Unlike pure rumination, this
+      // often means it was circling a task that genuinely needs a tool it never
+      // reached — so DON'T hard-commit to a no-tools answer. Instead fall through
+      // to the timeout-recovery path: inject the action-oriented directive and
+      // drop to the low-effort LLM so the retry decisively acts (tool OR answer).
+      if (error?.name === "NoCommitError") {
+        console.warn("[model:retry] no-commit guard fired — retrying with an action-oriented directive (low effort).");
+        lastError = error;
+        lastClassification = { class: "timeout", retryable: true, summary: "no-commit dribble runaway" } as LlmErrorClassification;
+      } else {
+        lastError = error;
+        lastClassification = classifyLlmError(error);
+      }
       const { class: cls, retryable, summary } = lastClassification;
+
+      // Timeout recovery. A per-call timeout means the model streamed past
+      // `getLlmTimeoutMs()` without finishing — usually a slow over-long
+      // generation or a repetition spiral on a pure-reasoning task. Retrying the
+      // IDENTICAL request just hits the same wall (this is how GAIA reasoning
+      // tasks burned 3×75s then returned empty). Inject a one-shot directive so
+      // each retry is productive: think briefly, then COMMIT to a concise answer.
+      if (cls === "timeout" && !timeoutRecoveryInjected) {
+        timeoutRecoveryInjected = true;
+        // Do NOT drop to low effort on the FIRST timeout. A per-call timeout on a
+        // hard pure-reasoning task (e.g. the GAIA Rubik's-edge puzzle) means the
+        // model needs its FULL capability — dropping to low effort here makes it
+        // dumber and guarantees it can't solve the puzzle, spiralling to an empty
+        // answer. Give it one more FULL-effort attempt with a commit directive
+        // instead. (Genuine "ruminate, never call a tool" cases are now steered by
+        // the FIRST-MOVE prompt directive and the action directive injected below.)
+        currentMessages = [
+          ...currentMessages,
+          {
+            role: "system" as const,
+            content:
+              "⚠️ Your previous attempt was taking too long and was stopped. Stay focused on the " +
+              "ORIGINAL request above — do NOT switch topics or invent a different question. " +
+              "Do not write a long chain of reasoning in prose. Instead make concrete progress NOW: " +
+              "call run_python for any calculation, call a search/browse tool to look something up, or " +
+              "state your answer directly if you already have enough information. Be efficient and decisive.",
+          },
+        ];
+        console.warn(`[model:retry] timeout — injecting an action-oriented directive (keeping full effort for one more attempt).`);
+      } else if (cls === "timeout" && lowEffortLlm && currentLlm !== lowEffortLlm) {
+        // A SUBSEQUENT timeout: full effort + the directive already failed once.
+        // Now drop to the low-effort sibling so the retry stops ruminating and
+        // commits to acting (tool OR answer) before the run budget is exhausted.
+        currentLlm = lowEffortLlm;
+        console.warn(`[model:retry] repeat timeout — dropping to low reasoning effort for the retry.`);
+      }
+
+      // Context-overflow recovery (one-shot). `context_length` is normally
+      // non-retryable — the request is simply too big. But we CAN shrink it:
+      // aggressively condense old tool results (threshold 0, minimal protected
+      // tail) and retry with the smaller payload. This rescues long
+      // search/browse-heavy runs that would otherwise hard-fail mid-task.
+      if (cls === "context_length" && !contextRecoveryDone) {
+        contextRecoveryDone = true;
+        const compressed = compressToolResults(currentMessages, {
+          thresholdTokens: 0,
+          protectTail: 2,
+          minToolChars: 200,
+        });
+        if (compressed.changed) {
+          console.warn(
+            `[model:retry] context overflow — emergency compressed ${compressed.prunedCount} tool result(s): ` +
+            `${compressed.tokensBefore}→${compressed.tokensAfter} tokens. Retrying with smaller payload.`
+          );
+          currentMessages = compressed.messages;
+          continue; // retry immediately, no backoff — the payload changed, not the provider
+        }
+        console.warn(`[model:retry] context overflow but nothing left to compress — giving up.`);
+      }
 
       if (!retryable && !lastClassification.failoverable) {
         console.error(`[model:retry] non-retryable ${cls}: ${summary.slice(0, 200)}`);
@@ -102,7 +606,7 @@ export async function invokeWithRetry(
     if (signal?.aborted) throw new AgentAbortError();
     console.warn(`[model:failover] primary failed with ${lastClassification?.class}. Switching to secondary provider for one attempt.`);
     try {
-      return await failoverLLM!.invoke(messages);
+      return await failoverLLM!.invoke(currentMessages);
     } catch (error: any) {
       const failoverClass = classifyLlmError(error);
       console.error(`[model:failover] secondary also failed (${failoverClass.class}): ${describeError(error)}`);
@@ -126,6 +630,9 @@ export function createAgentGraph(
   const activeTools = isSubagent ? subagentTools : parentTools;
   const activeMainLLM = isSubagent ? subagentLLM : agentLLM;
   const activeResearchLLM = isSubagent ? subagentResearchLLM : researchLLM;
+  // Low-effort siblings for the timeout-retry path (break a rumination spiral).
+  const activeMainLLMLow = isSubagent ? subagentLLMLow : agentLLMLow;
+  const activeResearchLLMLow = isSubagent ? subagentResearchLLMLow : researchLLMLow;
 
   /**
    * Concurrent tool executor. Replaces LangGraph's default sequential
@@ -194,7 +701,8 @@ export function createAgentGraph(
       }
 
       const runOnce = (async () => {
-        const output = await found.invoke(call.args ?? {});
+        const coercedArgs = coerceToolArgs(found, call.args ?? {});
+        const output = await found.invoke(coercedArgs);
         return typeof output === "string" ? output : JSON.stringify(output);
       })();
       resultByKey.set(key, runOnce);
@@ -272,6 +780,15 @@ export function createAgentGraph(
       const content = contentToText(msg.content ?? msg.kwargs?.content ?? "");
       if (content.length <= SUMMARIZE_THRESHOLD) return null;
       const toolName = msg.name || msg.kwargs?.name || msg.tool_call_id || "";
+      // Transcription tools ARE the answer: their entire output is the OCR /
+      // vision reading / speech transcript the model must work from. Slicing the
+      // middle out drops list items (e.g. the GAIA fractions worksheet's sample
+      // problems), which forces the model to re-query and run out the clock.
+      // These outputs are already bounded (vision max_tokens, short transcripts),
+      // so leave them intact.
+      if (toolName.includes("transcribe_audio") || toolName.includes("screenshot_analyze")) {
+        return null;
+      }
       let condensed: string;
       if (toolName.includes("search") || toolName === "search_web") {
         condensed = extractSearchResults(content);
@@ -361,6 +878,15 @@ export function createAgentGraph(
       console.log(`[model:call] Injected failure hint into context`);
     }
 
+    // Soft deadline: once we're past 80% of the hard run timeout, stop starting
+    // new tool calls and force a final answer from what's gathered. Reuses the
+    // budget-exhausted path so the model always returns SOMETHING instead of
+    // timing out with an empty answer on a long browse/search chain.
+    if (!runCtx.budgetExceeded && runCtx.softDeadlineAt && Date.now() >= runCtx.softDeadlineAt) {
+      runCtx.budgetExceeded = true;
+      runCtx.budgetExceededReason = "time budget reached — answer from what you have";
+    }
+
     if (runCtx.budgetExceeded) {
       console.warn(`[model:call] ⚠️ BUDGET EXCEEDED — forcing final answer (${runCtx.budgetExceededReason ?? `${runCtx.toolCallCount} calls`} used)`);
       const budgetStopMsg = {
@@ -376,6 +902,14 @@ export function createAgentGraph(
       };
       const messagesWithStop = [...effectiveMessages, budgetStopMsg];
       const response = await invokeWithRetry(messagesWithStop, signal, 2, noToolsLLM);
+      // Never hand back a blank/truncated forced answer — convert it into an
+      // actionable explanation (Hermes turn-completion-explainer pattern).
+      const rawText = contentToText(response.content);
+      const explained = explainEmptyFinal(rawText, runCtx.budgetExceededReason ?? "budget", true);
+      if (explained !== rawText) {
+        response.content = explained;
+        console.warn(`[model:call] → empty/partial forced answer replaced with explainer (${explained.length} chars)`);
+      }
       const text = contentToText(response.content);
       console.log(`[model:call] → forced text response (${text.length} chars): ${text.slice(0, 120).replace(/\n/g, " ")}`);
       return { messages: [response] };
@@ -386,13 +920,13 @@ export function createAgentGraph(
       // Route through invokeWithRetry so even simple queries get retry +
       // failover and respect the abort signal (previously a transient 503 on
       // a "simple" turn crashed the whole run, and a cancel was ignored).
-      response = await invokeWithRetry(effectiveMessages, signal, 3, noToolsLLM);
+      response = await invokeWithRetry(effectiveMessages, signal, 3, noToolsLLM, undefined, runCtx.softDeadlineAt);
       console.log(`[model:call] Using noToolsLLM (simple query, no tools)`);
     } else if (runCtx.loopNudgeSent || (runCtx.complexity === "complex" && isResearchQuery(effectiveMessages))) {
-      response = await invokeWithRetry(effectiveMessages, signal, 3, activeResearchLLM);
+      response = await invokeWithRetry(effectiveMessages, signal, 3, activeResearchLLM, activeResearchLLMLow, runCtx.softDeadlineAt);
       console.log(`[model:call] Using researchLLM (temp 0.4)`);
     } else {
-      response = await invokeWithRetry(effectiveMessages, signal, 3, activeMainLLM);
+      response = await invokeWithRetry(effectiveMessages, signal, 3, activeMainLLM, activeMainLLMLow, runCtx.softDeadlineAt);
     }
 
     // ── Hermes/Kimi native-token recovery ──────────────────────────────────
@@ -401,19 +935,27 @@ export function createAgentGraph(
     // `tool_calls`. When that happens the loop would otherwise stream the raw
     // `<|tool_call_begin|>…` markup to the user and never run the tool. Recover
     // the structured calls from the text and scrub the markers from content.
+    // ── Native tool-token recovery (model-agnostic) ────────────────────────
+    // OpenAI-compatible endpoints serving open models (Kimi, GLM, …) sometimes
+    // fail to parse the model's NATIVE tool-call tokens, leaking them as plain
+    // assistant text. The loop would then see an empty `tool_calls` array, treat
+    // the markup as a final answer, run no tool, and stream raw markup to the
+    // user. `tool-call-recovery.ts` is the single source of truth: one entry
+    // point recovers every known leak format (Kimi sections, GLM XML,
+    // JSON-in-tag, parenthesized, bare function JSON) into canonical tool calls.
     {
       const rawContent = contentToText((response as any).content);
       const existingToolCalls = (response as any).tool_calls ?? [];
-      if (existingToolCalls.length === 0 && containsHermesToolTokens(rawContent)) {
-        const { toolCalls: recovered, cleanedText } = parseHermesToolCalls(rawContent);
+      if (existingToolCalls.length === 0 && containsToolCallTokens(rawContent)) {
+        const { toolCalls: recovered, cleanedText } = extractToolCallsFromText(rawContent);
         if (recovered.length > 0) {
-          console.warn(`[model:call] ⚠️ Recovered ${recovered.length} tool call(s) from raw Kimi tokens: ${recovered.map((t) => t.name).join(", ")}`);
+          console.warn(`[model:call] ⚠️ Recovered ${recovered.length} tool call(s) from leaked native tokens: ${recovered.map((t) => t.name).join(", ")}`);
           (response as any).tool_calls = recovered;
           (response as any).content = cleanedText;
         } else {
-          // Tokens present but unparseable — at least don't leak markup.
-          console.warn(`[model:call] ⚠️ Kimi tool tokens present but unparseable — stripping markup.`);
-          (response as any).content = stripHermesToolTokens(rawContent);
+          // Markup present but unparseable — at least don't leak it to the user.
+          console.warn(`[model:call] ⚠️ Tool-call markup present but unparseable — stripping it.`);
+          (response as any).content = stripToolCallTokens(rawContent);
         }
       }
     }
@@ -423,16 +965,28 @@ export function createAgentGraph(
     // ── Inline reasoning hygiene (storage boundary) ────────────────────────
     // Some models reason via inline tags (<think>…</think>,
     // <REASONING_SCRATCHPAD>…) embedded in content instead of structured
-    // reasoning fields. Strip those blocks from the stored content so the raw
+    // reasoning fields. Strip those blocks from the VISIBLE content so the raw
     // tags + private chain-of-thought never (a) inflate context on later
     // turns, (b) leak into saved history, or (c) pollute the critic / title
     // generation. The streaming layer (index.ts) already routed the reasoning
-    // to the thinking pane; here we just keep the persisted message clean.
+    // to the thinking pane.
+    //
+    // We do NOT discard the reasoning outright (the old behavior). Instead we
+    // preserve it into `additional_kwargs.reasoning_content` — the same field
+    // structured-reasoning models use — so it (a) survives into checkpoints for
+    // forensics and (b) round-trips to any provider that consumes a thinking
+    // channel, without bloating the visible answer. Mirrors Hermes'
+    // `_copy_reasoning_content_for_api`.
     {
       const rawContent = contentToText((response as any).content);
       if (containsInlineReasoning(rawContent)) {
-        const { cleaned } = extractInlineReasoning(rawContent);
+        const { reasoning, cleaned } = extractInlineReasoning(rawContent);
         (response as any).content = cleaned;
+        if (reasoning) {
+          const kwargs = ((response as any).additional_kwargs ??= {});
+          const existing = typeof kwargs.reasoning_content === "string" ? kwargs.reasoning_content : "";
+          kwargs.reasoning_content = existing ? `${existing}\n\n${reasoning}` : reasoning;
+        }
         if (toolCalls.length === 0 && !cleaned.trim()) {
           console.warn(`[model:call] ⚠️ Turn was pure inline reasoning with no answer/tool calls.`);
         }
@@ -517,6 +1071,29 @@ export function createAgentGraph(
       return { messages: [wrapUpNudge, response] };
     }
 
+    // Incremental-REPL consolidation breaker (one-shot). If the model has run
+    // code many times (run_python/run_terminal/run_node) without yet producing a
+    // final answer, it's likely poking the problem one tiny snippet at a time —
+    // re-reading the file, re-deriving partial state — and will exhaust its time
+    // or budget before converging (GAIA maze task 65afbc8a: 11+ run_python calls,
+    // timed out, no answer; another run burned 19 run_terminal calls and guessed).
+    // detectLoop misses this because each snippet's args differ. Nudge it ONCE to
+    // write a single complete end-to-end script instead.
+    if (toolCalls.length > 0 && runCtx.codeExecCount >= 6 && !runCtx.consolidationNudgeSent) {
+      runCtx.consolidationNudgeSent = true;
+      console.warn(`[model:call] ⚠️ ${runCtx.codeExecCount} code-exec calls without an answer — injecting consolidation nudge.`);
+      const consolidateNudge = {
+        role: "system" as const,
+        content:
+          `You have run code ${runCtx.codeExecCount} times without producing a final answer. ` +
+          "STOP solving this in small pieces. If this is a self-contained computation, file " +
+          "analysis, or puzzle, write ONE complete script that solves it end-to-end in a single " +
+          "run: load all needed data, do the full computation, and print the final result. " +
+          "Do not re-inspect what you have already inspected. After this run, state your answer.",
+      };
+      return { messages: [consolidateNudge, response] };
+    }
+
     if (toolCalls.length > 0) {
       console.log(`[model:call] → tool_calls (${toolCalls.length}): ${toolCalls.map((t: any) => t.name).join(", ")} [${runCtx.toolCallCount}/${runCtx.budget.maxToolCalls}]`);
       // Gentle one-time nudge when the model jumped straight to a tool with no
@@ -557,13 +1134,48 @@ export function createAgentGraph(
       };
       try {
         const recovered = await invokeWithRetry([...effectiveMessages, summarizeMsg], signal, 2, noToolsLLM);
-        const recoveredText = stripHermesToolTokens(contentToText(recovered.content)).trim();
+        const recoveredText = stripToolCallTokens(contentToText(recovered.content)).trim();
         if (recoveredText) {
           console.log(`[model:call] → recovered answer (${recoveredText.length} chars)`);
           return { messages: [{ ...recovered, content: recoveredText, tool_calls: undefined }] };
         }
       } catch (err: any) {
         console.warn(`[model:call] empty-answer recovery failed: ${err?.message ?? err}`);
+      }
+    }
+
+    // Output-degeneration recovery (one-shot). GLM-5.2 sometimes collapses
+    // mid-generation into repeated garbage ("Let me research...Let me need",
+    // "0:0|0>0|0)2)") that streams for minutes and becomes the answer. Discard
+    // it and retry ONCE with a short, constrained, tool-less prompt so the user
+    // gets a real answer instead of garbage. Guarded so it can't loop.
+    if (finalText.length >= 400 && !runCtx.degenerationRecovered && isDegenerateText(finalText)) {
+      runCtx.degenerationRecovered = true;
+      console.warn(`[model:call] ⚠️ Output degeneration detected (${finalText.length} chars of repetition) — discarding and retrying once.`);
+      const recoverMsg = {
+        role: "system" as const,
+        content:
+          "Your previous response broke down into repeated text. Ignore it completely. " +
+          "Answer the user's question directly now in 1-4 sentences using ONLY what you already know " +
+          "from this conversation. Do NOT call any tools. Do NOT repeat yourself. " +
+          "If you are unsure, give your single best answer plainly.",
+      };
+      try {
+        const recovered = await invokeWithRetry([...effectiveMessages, recoverMsg], signal, 2, noToolsLLM);
+        const recoveredText = stripToolCallTokens(contentToText(recovered.content)).trim();
+        if (recoveredText && !isDegenerateText(recoveredText)) {
+          console.log(`[model:call] → recovered from degeneration (${recoveredText.length} chars)`);
+          return { messages: [{ ...recovered, content: recoveredText, tool_calls: undefined }] };
+        }
+        console.warn(`[model:call] degeneration retry still weak — returning a safe fallback.`);
+        return {
+          messages: [{
+            role: "assistant" as const,
+            content: "I wasn't able to produce a clean answer for this one. Please try rephrasing or narrowing the question.",
+          }],
+        };
+      } catch (err: any) {
+        console.warn(`[model:call] degeneration recovery failed: ${err?.message ?? err}`);
       }
     }
 
@@ -574,8 +1186,78 @@ export function createAgentGraph(
   async function criticNode(state: typeof MessagesAnnotation.State) {
     const lastMsg = state.messages[state.messages.length - 1] as any;
 
-    // Skip critique if it's not a final text response or if it's a simple query
-    if (lastMsg.tool_calls?.length > 0 || runCtx.complexity === "simple") {
+    // GAIA FORMAT AUDIT — runs regardless of complexity, before the normal
+    // complexity gate. GAIA grades by EXACT MATCH, so a right value in the wrong
+    // unit/scale/format scores zero (e.g. answering "17000" when the question
+    // asks "how many THOUSAND hours" → graded answer is "17"). Most GAIA tasks
+    // classify as simple/moderate, so the normal critic never runs on them and
+    // these format slips go unchecked. This auditor reconciles the FINAL ANSWER
+    // line against the question's exact wording. One-shot (gaiaFormatAudited) so
+    // it can't loop, and only on a final (no-tool-calls) answer.
+    if (
+      runCtx.benchmarkMode === "gaia" &&
+      !(lastMsg.tool_calls?.length > 0) &&
+      !runCtx.gaiaFormatAudited &&
+      !signal?.aborted
+    ) {
+      runCtx.gaiaFormatAudited = true;
+      const proposedGaia = contentToText(lastMsg.content);
+      // Only audit when there's an actual FINAL ANSWER line to check; an empty
+      // or planning-only reply is the empty-final recovery's job, not ours.
+      if (/FINAL ANSWER\s*:/i.test(proposedGaia)) {
+        const auditPrompt =
+          `You are a STRICT format auditor for the GAIA benchmark. GAIA grades by EXACT MATCH on the single \`FINAL ANSWER:\` line. ` +
+          `Your ONLY job is to catch FORMAT/UNIT/SCALE mismatches between what the question asks and what the FINAL ANSWER line says. ` +
+          `Do NOT re-do the research or second-guess any FACT — assume the computed value is correct.\n\n` +
+          `QUESTION: """${(runCtx.prompt || "").slice(0, 2000)}"""\n\n` +
+          `AGENT REPLY (prose + FINAL ANSWER line): """${proposedGaia.slice(0, 3000)}"""\n\n` +
+          `Check ONLY these, in order:\n` +
+          `1. UNIT/SCALE: Does the question ask for a specific unit or scale (e.g. "how many THOUSAND hours", "in millions", "in km", a percentage)? If the FINAL ANSWER is in the wrong scale (e.g. "17000" when asked for thousands, should be "17"), that's a mismatch.\n` +
+          `2. ROUNDING: Did the question ask to round to a specific precision and the FINAL ANSWER didn't?\n` +
+          `3. SEPARATORS/UNITS: Numbers must be digits only — no commas, no "$", no "%", no trailing unit words — UNLESS the question explicitly asks for them.\n` +
+          `4. LIST FORMAT/ORDER: If a list, are items in the exact requested order, comma-separated, no articles?\n` +
+          `5. STRAY TEXT: The FINAL ANSWER line must contain ONLY the bare answer — no "approximately", no restated units, no explanation.\n\n` +
+          `If EVERYTHING is correct, reply with the single word OK.\n` +
+          `If there is a fixable format/unit/scale mismatch, reply with: FIX: <the corrected bare answer that should go on the FINAL ANSWER line>. ` +
+          `Give ONLY the corrected token(s), nothing else. Do NOT call any tools.`;
+        try {
+          const auditResp = await noToolsLLM.invoke([{ role: "user", content: auditPrompt }], {
+            tags: ["candle-internal"],
+            signal,
+          });
+          const auditText = contentToText(auditResp.content).trim();
+          const fixMatch = auditText.match(/^\s*FIX\s*:\s*(.+)$/is);
+          if (fixMatch) {
+            const corrected = fixMatch[1].trim().replace(/^["'`]|["'`]$/g, "");
+            console.warn(`[gaia-audit] format fix: "${corrected.slice(0, 80)}"`);
+            return {
+              messages: [
+                {
+                  role: "system" as const,
+                  content:
+                    `GAIA FORMAT CHECK: your FINAL ANSWER line has a unit/scale/format mismatch with what the question asks. ` +
+                    `Re-read the question's exact wording (unit, scale, rounding, separators, ordering). ` +
+                    `Keep your computed result, but output the answer in the EXACT requested format. ` +
+                    `The corrected FINAL ANSWER should be: ${corrected}\n\n` +
+                    `Reply with your full answer ending in exactly one line: \`FINAL ANSWER: ${corrected}\`. Do NOT call any tools.`,
+                },
+              ],
+            };
+          }
+          console.log(`[gaia-audit] format OK`);
+        } catch (err: any) {
+          console.warn(`[gaia-audit] LLM call failed: ${err?.message ?? err} — skipping audit.`);
+        }
+      }
+    }
+
+    // Skip critique unless the run is genuinely complex. The critic adds a full
+    // extra LLM round-trip (~one model latency) to every turn it runs on. On
+    // simple/moderate queries (a greeting, a single-fact lookup like "latest
+    // chapter") that round-trip roughly doubles the perceived response time for
+    // little benefit — those answers are short and self-evident. Reserve it for
+    // complex multi-step work where a wrong/incomplete final answer is costly.
+    if (lastMsg.tool_calls?.length > 0 || runCtx.complexity !== "complex") {
        return { messages: [] };
     }
 
@@ -590,16 +1272,13 @@ export function createAgentGraph(
     // Skip critique if the agent has no budget left to ACT on a rejection.
     // Rejecting here just forces a tool-less re-run that emits a useless
     // planning preamble ("Plan: 1) ...") as the final answer — strictly worse
-    // than the real answer we already have. We treat "exceeded" OR the
-    // warning threshold (within 2 calls of the cap, or cost ≥90% of ceiling)
-    // as "no room to redo".
+    // than the real answer we already have. We skip when the run is out of
+    // call budget (exceeded, or within 2 calls of the cap) so there's no room
+    // to act on a rejection. costScore is telemetry-only now and never blocks.
     const callsLeft = runCtx.budget.maxToolCalls - runCtx.toolCallCount;
-    const nearBudgetEnd =
-      runCtx.budgetExceeded ||
-      callsLeft <= 2 ||
-      runCtx.costScore >= runCtx.costCeiling * 0.9;
+    const nearBudgetEnd = runCtx.budgetExceeded || callsLeft <= 2;
     if (nearBudgetEnd) {
-       console.log(`[critic] Skipping critique — no budget headroom to act on a rejection (calls ${runCtx.toolCallCount}/${runCtx.budget.maxToolCalls}, cost ${runCtx.costScore}/${runCtx.costCeiling}).`);
+       console.log(`[critic] Skipping critique — no budget headroom to act on a rejection (calls ${runCtx.toolCallCount}/${runCtx.budget.maxToolCalls}).`);
        return { messages: [] };
     }
 
@@ -633,13 +1312,18 @@ export function createAgentGraph(
     const proposed = contentToText(lastMsg.content).slice(0, 4000);
 
     // Hard short-circuit: if the agent delivered a real artifact (a sandbox
-    // download link) or ran enough tools to have gathered real data, APPROVE
-    // without a critique call. The critic must never reject a delivered file,
-    // and must never second-guess FACTS the tools returned — it has no way to
-    // verify them and its training-knowledge "that hasn't happened yet" style
-    // objections were rejecting correct, tool-grounded answers.
-    const deliveredArtifact = /https?:\/\/\S*e2b\.app\/files\?|sandbox file|download/i.test(proposed)
-      || /\.(xlsx|pdf|csv|docx|pptx|zip|png|jpg|mp4|json)\b/i.test(proposed);
+    // download link), APPROVE without a critique call. The critic must never
+    // reject a delivered file, and must never second-guess FACTS the tools
+    // returned — it has no way to verify them and its training-knowledge
+    // "that hasn't happened yet" style objections were rejecting correct,
+    // tool-grounded answers.
+    //
+    // We require an actual sandbox download URL — NOT a bare filename mention.
+    // A plan-only preamble like "I need to inspect /home/user/x.png first…"
+    // names a file it has not yet read; treating that as a delivered artifact
+    // let a 0-tool planning answer skip the critic entirely (GAIA 9318445f).
+    // A genuinely delivered file in this system always carries a download URL.
+    const deliveredArtifact = /https?:\/\/\S*e2b\.app\/files\?/i.test(proposed);
     if (deliveredArtifact) {
       console.log(`[critic] Skipping critique — answer delivered an artifact/file.`);
       return { messages: [] };

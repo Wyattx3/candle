@@ -3,9 +3,13 @@ import { z } from "zod";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getClarificationGate } from "./clarification";
 import { cronManager } from "./agent/cron";
+import { kanbanBoard } from "./agent/kanban";
 import { getTodoStore } from "./agent/todo";
 import { getSkillByName, createSkill, listSkills, updateSkill, deleteSkill } from "./skills";
 import { runWithSandboxRetry, defaultE2BTemplate } from "./tools";
+import { checkpointStore } from "./agent/checkpoint";
+import { getSessionId } from "./agent/session";
+import { redactSecrets } from "./security";
 
 // ---------- Per-run subagent context plumbing ------------------------------
 // The parent's `runSubagent` lives in `agent/subagent.ts` and depends on
@@ -150,6 +154,93 @@ export const spawnSubagentsParallelTool = tool(
 );
 
 // ────────────────────────────────────────────────────────────────────────────
+// CROSS-SESSION RECALL: search the agent's own past runs (zero-LLM)
+// ────────────────────────────────────────────────────────────────────────────
+
+interface RecallRecord {
+  runId: string;
+  sessionId: string;
+  prompt: string;
+  partialAnswer: string;
+  status: string;
+  startedAt: number;
+  toolEvents: { name: string }[];
+}
+
+export interface RecallMatch {
+  runId: string;
+  when: string;
+  status: string;
+  prompt: string;
+  answerSnippet: string;
+  tools: string[];
+}
+
+/**
+ * Pure scoring + formatting for cross-session recall. Excludes the current
+ * session, ranks by keyword overlap (newest-first on ties), redacts secrets.
+ * Kept separate from the tool so it can be unit-tested without disk I/O.
+ */
+export function rankRecallMatches(
+  records: RecallRecord[],
+  query: string,
+  currentSession: string,
+  limit?: number
+): RecallMatch[] {
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((t) => t.replace(/[^a-z0-9]/g, ""))
+    .filter((t) => t.length >= 3);
+  if (terms.length === 0) return [];
+
+  const cap = Math.max(1, Math.min(10, Math.floor(limit ?? 5)));
+
+  return records
+    .filter((r) => r.sessionId !== currentSession)
+    .map((r) => {
+      const haystack = `${r.prompt} ${r.partialAnswer}`.toLowerCase();
+      const score = terms.reduce((acc, term) => acc + (haystack.includes(term) ? 1 : 0), 0);
+      return { record: r, score };
+    })
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score || b.record.startedAt - a.record.startedAt)
+    .slice(0, cap)
+    .map(({ record }) => ({
+      runId: record.runId,
+      when: new Date(record.startedAt).toISOString(),
+      status: record.status,
+      prompt: redactSecrets(record.prompt).slice(0, 300),
+      answerSnippet: redactSecrets(record.partialAnswer).slice(0, 500),
+      tools: Array.from(new Set(record.toolEvents.map((e) => e.name))).slice(0, 15),
+    }));
+}
+
+export const recallRunsTool = tool(
+  async ({ query, limit }) => {
+    const terms = query.replace(/[^a-z0-9\s]/gi, "").trim();
+    if (terms.length < 3) {
+      return JSON.stringify({ matches: [], note: "Query too short — use specific keywords." });
+    }
+    const matches = rankRecallMatches(checkpointStore.list(), query, getSessionId(), limit);
+    return JSON.stringify({ matches, count: matches.length }, null, 2);
+  },
+  {
+    name: "recall_runs",
+    description:
+      "Search your OWN past runs (previous conversations/tasks) by keyword. " +
+      "Use when the user references earlier work ('like we did before', 'the script from yesterday') " +
+      "or when you're stuck and want to check how a similar task was solved previously. " +
+      "Zero-cost keyword search over run checkpoints — returns past prompts, answer snippets, and which tools were used. " +
+      "The current conversation is excluded. Does NOT replay or resume a run; it's read-only recall.",
+    schema: z.object({
+      query: z.string().min(2).describe("Keywords to search past runs for (e.g. 'merge pdf invoices')."),
+      limit: z.number().min(1).max(10).optional().describe("Max results to return (default 5, max 10)."),
+    }),
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
 // NEW PHASE 3 TOOLS: Clarify, Cronjob, Todo, Patch
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -206,12 +297,13 @@ export const clarifyTool = tool(
 );
 
 export const cronjobTool = tool(
-  async ({ action, task, intervalMinutes, id }) => {
+  async ({ action, task, intervalMinutes, id, contextFromJobId }) => {
     try {
       if (action === "create") {
         if (!task || !intervalMinutes) return "Error: task and intervalMinutes required for create.";
-        const job = cronManager.addJob(task, intervalMinutes);
-        return `Cronjob created with ID: ${job.id} (every ${job.intervalMinutes} min).`;
+        const job = cronManager.addJob(task, intervalMinutes, contextFromJobId);
+        const chained = job.contextFromJobId ? ` (chained from job ${job.contextFromJobId})` : "";
+        return `Cronjob created with ID: ${job.id} (every ${job.intervalMinutes} min)${chained}.`;
       }
       if (action === "remove") {
         if (!id) return "Error: id required for remove.";
@@ -226,12 +318,80 @@ export const cronjobTool = tool(
   {
     name: "cronjob",
     description:
-      "Manage background scheduled cronjobs. Each job runs the given prompt through the agent in-process at the configured interval. Persists across restarts.",
+      "Manage background scheduled cronjobs. Each job runs the given prompt through the agent in-process at the configured interval. Persists across restarts. " +
+      "Chain jobs by passing contextFromJobId on create — the upstream job's latest output is prepended to this job's prompt at fire time, enabling pipelines (e.g. a 'fetch data' job feeding a 'summarize data' job).",
     schema: z.object({
       action: z.enum(["create", "remove", "list"]).describe("Action to perform."),
       task: z.string().optional().describe("The prompt/task to run (required for create)."),
       intervalMinutes: z.number().min(1).optional().describe("Interval in minutes — at least 1 (required for create)."),
       id: z.string().optional().describe("The ID of the job to remove (required for remove)."),
+      contextFromJobId: z
+        .string()
+        .optional()
+        .describe("Optional ID of an existing job whose latest output is prepended to this job's prompt (chaining). The upstream job must already exist."),
+    }),
+  }
+);
+
+function formatKanbanTask(t: any) {
+  return {
+    id: t.id,
+    title: t.title,
+    status: t.status,
+    dependsOn: t.dependsOn,
+    priority: t.priority,
+    attempts: t.consecutiveFailures,
+    error: t.error ? redactSecrets(t.error).slice(0, 200) : undefined,
+    result: t.result ? redactSecrets(t.result).slice(0, 400) : undefined,
+  };
+}
+
+export const kanbanTool = tool(
+  async ({ action, title, task, dependsOn, priority, maxRetries, id }) => {
+    try {
+      if (action === "add") {
+        if (!title || !task) return "Error: title and task are required for add.";
+        const created = kanbanBoard.addTask({ title, task, dependsOn, priority, maxRetries });
+        const dep = created.dependsOn.length ? ` (waits on: ${created.dependsOn.join(", ")})` : "";
+        return `Kanban task added: ${created.id} [${created.status}]${dep}. It will run autonomously in the background; check back with action="list".`;
+      }
+      if (action === "status") {
+        if (!id) return "Error: id required for status.";
+        const t = kanbanBoard.getTask(id);
+        return t ? JSON.stringify(formatKanbanTask(t), null, 2) : `Task ${id} not found.`;
+      }
+      if (action === "cancel") {
+        if (!id) return "Error: id required for cancel.";
+        return kanbanBoard.cancelTask(id) ? `Task ${id} cancelled.` : `Task ${id} not found or already finished.`;
+      }
+      if (action === "unblock") {
+        if (!id) return "Error: id required for unblock.";
+        return kanbanBoard.unblockTask(id) ? `Task ${id} unblocked and re-queued.` : `Task ${id} is not blocked.`;
+      }
+      // list
+      return JSON.stringify(kanbanBoard.listTasks().map(formatKanbanTask), null, 2);
+    } catch (e: any) {
+      return `Kanban error: ${e?.message ?? e}`;
+    }
+  },
+  {
+    name: "kanban",
+    description:
+      "Persistent multi-step work board for LONG-RUNNING, multi-task goals that should keep progressing in the background — even across process restarts. " +
+      "Unlike spawn_subagent (ephemeral, runs now, you wait for it) and todo (a checklist YOU work through this turn), kanban tasks are dispatched and executed AUTONOMOUSLY by background workers; you queue them and walk away.\n\n" +
+      "Each task is a SELF-CONTAINED prompt run by a worker with no chat history — include every detail (URLs, paths, requirements) in `task`. " +
+      "Use `dependsOn` to build pipelines: a task only starts once all its prerequisites finish, and their results are automatically fed into its prompt. " +
+      "Failed tasks retry up to maxRetries, then become 'blocked' (recover with action=unblock).\n\n" +
+      "When to use: a goal with several stages that can run unattended (e.g. 'research 3 competitors, then write a comparison, then draft an email'). " +
+      "When NOT to use: a single step (just do it), or work you need the result of THIS turn (use spawn_subagent).",
+    schema: z.object({
+      action: z.enum(["add", "list", "status", "cancel", "unblock"]).describe("Action to perform. Default workflow: add tasks, then list to monitor."),
+      title: z.string().optional().describe("Short human-readable label (required for add)."),
+      task: z.string().min(10).optional().describe("Self-contained worker prompt with ALL context — the worker has no chat history (required for add)."),
+      dependsOn: z.array(z.string()).optional().describe("IDs of tasks that must complete first. Their results are fed into this task's prompt."),
+      priority: z.number().optional().describe("Higher runs first among ready tasks. Default 0."),
+      maxRetries: z.number().optional().describe("Retries before the task is blocked. Default 2."),
+      id: z.string().optional().describe("Task ID (required for status/cancel/unblock)."),
     }),
   }
 );

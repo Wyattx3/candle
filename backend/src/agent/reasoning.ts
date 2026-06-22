@@ -85,6 +85,18 @@ export function extractInlineReasoning(content: string): {
     return "";
   });
 
+  // Orphan CLOSE tag: a `</think>` with no matching open tag before it. Reasoning
+  // models (GLM, DeepSeek-R1) sometimes stream their think block via the
+  // structured `reasoning_content` channel, then the content field carries the
+  // leftover `…draft</think>answer` — or emit a bare `</think>` separator inline.
+  // Everything BEFORE the first orphan close tag is reasoning; keep what follows.
+  const orphanClose = cleaned.match(CLOSE_TAG_RE);
+  if (orphanClose && orphanClose.index !== undefined) {
+    const before = cleaned.slice(0, orphanClose.index).trim();
+    if (before) parts.push(before);
+    cleaned = cleaned.slice(orphanClose.index + orphanClose[0].length);
+  }
+
   // Unterminated reasoning block: opening tag with no matching close. Capture
   // from the opening tag to end-of-string as reasoning, drop it from content.
   const openMatch = cleaned.match(OPEN_TAG_RE);
@@ -131,11 +143,13 @@ export function extractStructuredReasoning(message: any): string {
     : {};
 
   const parts: string[] = [];
+  // Preserve whitespace VERBATIM. This runs per streaming delta, and a delta is
+  // a fragment like " user" — trimming it (or the joined result) strips the
+  // inter-token spaces and the thinking pane renders "Theuseris". Only skip
+  // truly empty strings; dedup on the raw value handles a field that appears in
+  // both `additional_kwargs` and on the message.
   const push = (v: unknown) => {
-    if (typeof v === "string") {
-      const t = v.trim();
-      if (t && !parts.includes(t)) parts.push(t);
-    }
+    if (typeof v === "string" && v.length > 0 && !parts.includes(v)) parts.push(v);
   };
 
   // Field may live on additional_kwargs (LangChain) or directly on the message.
@@ -153,7 +167,7 @@ export function extractStructuredReasoning(message: any): string {
     }
   }
 
-  return parts.join("\n\n").trim();
+  return parts.join("\n\n");
 }
 
 /**
@@ -199,6 +213,20 @@ export class ThinkStreamFilter {
       }
 
       const open = this.matchTag(OPEN_TAG_RE);
+      const close = this.matchTag(CLOSE_TAG_RE);
+
+      // Orphan CLOSE tag with no matching open before it. Reasoning models
+      // (GLM, DeepSeek-R1) sometimes leak their draft thinking into the content
+      // channel followed by a bare `</think>`, then the real answer. Treat
+      // everything before the orphan close as reasoning, strip the tag, and keep
+      // scanning what follows as the answer. Only when the close precedes any
+      // open (a real `<think>…</think>` pair is handled by the open branch).
+      if (close && (!open || close.index < open.index)) {
+        reasoning += this.buf.slice(0, close.index);
+        this.buf = this.buf.slice(close.index + close.length);
+        continue;
+      }
+
       if (!open) {
         const safe = this.takeSafePrefix();
         answer += safe;

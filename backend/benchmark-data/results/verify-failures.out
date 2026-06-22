@@ -1,0 +1,36 @@
+[verify] waiting for main run to finish…
+[verify] main run complete.
+GAIA RESULT: 40/53 (75.5%)
+[verify] failures to re-run in isolation: 8e867cd7-cff9-4e6c-867a-ff5ddc2550be 5cfb274c-0207-4aa7-9575-6ac0bd95d9b2 b816bfce-3d80-4913-a07d-69b752ce6377 cca530fc-4052-43b2-b130-b30968d8aa44 9318445f-fe6a-4e1b-acbf-c68228c9906a 65afbc8a-89ca-4ad5-8d62-355bb401f61d 99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3 d0633230-7067-47a9-9dbf-ee11e0a2cdd6 0383a3ee-47a7-41a4-b493-519bdefe0488 e142056d-56ab-4352-b091-b56054bd1359 7673d772-ef80-4f0f-a602-1bf4485c9b43 c365c1c7-a3db-4d5e-a9a1-66f56eae7865 7d4a7d1d-cac6-44a8-96e8-ea9584a70825
+[verify] === re-running 8e867cd7-cff9-4e6c-867a-ff5ddc2550be (8e867cd7-cff9-4e6c-867a-ff5ddc2550be) alone ===
+[verify] 8e867cd7-cff9-4e6c-867a-ff5ddc2550be → still FAILS alone (genuine)
+[verify] === re-running 5cfb274c-0207-4aa7-9575-6ac0bd95d9b2 (5cfb274c-0207-4aa7-9575-6ac0bd95d9b2) alone ===
+[verify] 5cfb274c-0207-4aa7-9575-6ac0bd95d9b2 → still FAILS alone (genuine)
+[verify] === re-running b816bfce-3d80-4913-a07d-69b752ce6377 (b816bfce-3d80-4913-a07d-69b752ce6377) alone ===
+[verify] b816bfce-3d80-4913-a07d-69b752ce6377 → still FAILS alone (genuine)
+[verify] === re-running cca530fc-4052-43b2-b130-b30968d8aa44 (cca530fc-4052-43b2-b130-b30968d8aa44) alone ===
+[verify] cca530fc-4052-43b2-b130-b30968d8aa44 → still FAILS alone (genuine)
+[verify] === re-running 9318445f-fe6a-4e1b-acbf-c68228c9906a (9318445f-fe6a-4e1b-acbf-c68228c9906a) alone ===
+[verify] 9318445f-fe6a-4e1b-acbf-c68228c9906a → still FAILS alone (genuine)
+[verify] === re-running 65afbc8a-89ca-4ad5-8d62-355bb401f61d (65afbc8a-89ca-4ad5-8d62-355bb401f61d) alone ===
+[verify] 65afbc8a-89ca-4ad5-8d62-355bb401f61d → still FAILS alone (genuine)
+[verify] === re-running 99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3 (99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3) alone ===
+[verify] 99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3 → still FAILS alone (genuine)
+[verify] === re-running d0633230-7067-47a9-9dbf-ee11e0a2cdd6 (d0633230-7067-47a9-9dbf-ee11e0a2cdd6) alone ===
+[verify] d0633230-7067-47a9-9dbf-ee11e0a2cdd6 → still FAILS alone (genuine)
+[verify] === re-running 0383a3ee-47a7-41a4-b493-519bdefe0488 (0383a3ee-47a7-41a4-b493-519bdefe0488) alone ===
+[verify] 0383a3ee-47a7-41a4-b493-519bdefe0488 → still FAILS alone (genuine)
+[verify] === re-running e142056d-56ab-4352-b091-b56054bd1359 (e142056d-56ab-4352-b091-b56054bd1359) alone ===
+[verify] e142056d-56ab-4352-b091-b56054bd1359 → still FAILS alone (genuine)
+[verify] === re-running 7673d772-ef80-4f0f-a602-1bf4485c9b43 (7673d772-ef80-4f0f-a602-1bf4485c9b43) alone ===
+[verify] 7673d772-ef80-4f0f-a602-1bf4485c9b43 → still FAILS alone (genuine)
+[verify] === re-running c365c1c7-a3db-4d5e-a9a1-66f56eae7865 (c365c1c7-a3db-4d5e-a9a1-66f56eae7865) alone ===
+[verify] c365c1c7-a3db-4d5e-a9a1-66f56eae7865 → still FAILS alone (genuine)
+[verify] === re-running 7d4a7d1d-cac6-44a8-96e8-ea9584a70825 (7d4a7d1d-cac6-44a8-96e8-ea9584a70825) alone ===
+[verify] 7d4a7d1d-cac6-44a8-96e8-ea9584a70825 → still FAILS alone (genuine)
+
+============================================================
+[verify] RECONCILED RESULT
+  recovered (throttle artifacts, pass alone):
+  genuine failures (fail alone): 8e867cd7-cff9-4e6c-867a-ff5ddc2550be 5cfb274c-0207-4aa7-9575-6ac0bd95d9b2 b816bfce-3d80-4913-a07d-69b752ce6377 cca530fc-4052-43b2-b130-b30968d8aa44 9318445f-fe6a-4e1b-acbf-c68228c9906a 65afbc8a-89ca-4ad5-8d62-355bb401f61d 99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3 d0633230-7067-47a9-9dbf-ee11e0a2cdd6 0383a3ee-47a7-41a4-b493-519bdefe0488 e142056d-56ab-4352-b091-b56054bd1359 7673d772-ef80-4f0f-a602-1bf4485c9b43 c365c1c7-a3db-4d5e-a9a1-66f56eae7865 7d4a7d1d-cac6-44a8-96e8-ea9584a70825
+============================================================

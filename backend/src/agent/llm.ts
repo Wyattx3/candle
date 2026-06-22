@@ -26,6 +26,7 @@ import {
   capabilityCatalogTool,
   createArtifactTool,
   downloadVideoTool,
+  transcribeAudioTool,
   getSandboxFileUrlTool,
   httpRequestTool,
   inspectSandboxFileTool,
@@ -37,20 +38,25 @@ import {
   readSandboxFileTool,
   runNodeTool,
   runPythonTool,
+  runPythonWithToolsTool,
   runTerminalTool,
   sandboxBrowserTool,
   screenshotAnalyzeTool,
   searchWebTool,
+  researchTool,
+  financeResearchTool,
   setE2BTemplateTool,
   writeSandboxFileTool,
 } from "../tools";
 import {
   clarifyTool,
   cronjobTool,
+  kanbanTool,
   todoTool,
   patchFileTool,
   skillViewTool,
   skillManageTool,
+  recallRunsTool,
   spawnSubagentTool,
   spawnSubagentsParallelTool
 } from "../tools_extra";
@@ -84,16 +90,96 @@ export const MODEL_NAME = process.env.MODEL_NAME || "@cf/moonshotai/kimi-k2.6";
  * fails fast and `invokeWithRetry` can retry / failover. Default 75s; override
  * with LLM_REQUEST_TIMEOUT_MS.
  */
-function getLlmTimeoutMs(): number {
+export function getLlmTimeoutMs(): number {
   const parsed = Number(process.env.LLM_REQUEST_TIMEOUT_MS);
   if (!Number.isFinite(parsed)) return 75_000;
   return Math.max(15_000, Math.min(180_000, Math.floor(parsed)));
+}
+
+/**
+ * Reasoning cap (ms) — anti-rumination. The real root cause of GAIA
+ * `timeout_0_tools` was the model getting stuck in a single 94-250s
+ * reasoning-only generation that never committed to a tool call or answer; the
+ * run-level timeout then fired mid-generation and emitted a garbage placeholder.
+ * This cap bounds how long a turn may stream ONLY reasoning tokens (no content,
+ * no tool-call args) before it is aborted and force-committed to a no-tools
+ * answer. It is NOT a content-stall timer (that approach killed healthy thinking
+ * phases) — the clock only counts reasoning-without-action and resets the moment
+ * the model emits real output. Default 45s; override with LLM_REASONING_COMMIT_MS.
+ * Clamped to [15s, timeout-5s] so a healthy long think can still finish while a
+ * true runaway is broken well before the run budget is exhausted.
+ */
+export function getLlmReasoningCommitMs(): number {
+  const parsed = Number(process.env.LLM_REASONING_COMMIT_MS);
+  const fallback = 45_000;
+  const value = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+  const upper = Math.max(15_000, getLlmTimeoutMs() - 5_000);
+  return Math.max(15_000, Math.min(upper, value));
+}
+
+/**
+ * No-commit deadline (ms) — anti-dribble. Bounds wall-clock since a generation
+ * STARTED before it must have committed to a real action: a complete tool call
+ * OR a substantial answer. This catches the slow-dribble runaway that defeats
+ * the reasoning cap — the model emits occasional content tokens (resetting the
+ * reasoning clock) yet never commits, burning the full run budget (the GAIA
+ * `timeout_0_tools` failures that hid as `precision`: t=0, ~250s). Unlike the
+ * reasoning cap, dribbled content does NOT reset this — only a real commitment
+ * does. On fire the turn is retried with an action-oriented directive. Default
+ * 60s; override with LLM_COMMIT_DEADLINE_MS. Clamped to [30s, timeout-5s].
+ */
+export function getLlmCommitDeadlineMs(): number {
+  const parsed = Number(process.env.LLM_COMMIT_DEADLINE_MS);
+  const fallback = 60_000;
+  const value = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+  const upper = Math.max(30_000, getLlmTimeoutMs() - 5_000);
+  return Math.max(30_000, Math.min(upper, value));
 }
 
 // `maxRetries: 0` — we own retry/backoff in `invokeWithRetry`. Letting the SDK
 // ALSO retry (default 2) silently multiplies latency on a flaky provider
 // (2 internal × our 3 = up to 6 waits) and can blow past the run timeout.
 const LLM_CALL_TUNING = { timeout: getLlmTimeoutMs(), maxRetries: 0 } as const;
+
+/**
+ * Extended-thinking lever. Reasoning models (Kimi-k2-thinking, DeepSeek-R1,
+ * o-series, GLM-thinking) only engage their chain-of-thought when the request
+ * asks for it. Without this the model rushes straight to an answer/tool call —
+ * the "feels shallow" symptom. When `REASONING_EFFORT` is set we pass it
+ * through as an OpenAI-compatible `reasoning_effort` model kwarg.
+ *
+ * Default UNSET → no kwarg added → zero behavior change (and no risk of a 400
+ * from a provider that rejects unknown params). Operators opt in once they know
+ * their endpoint supports it. Applies to the reasoning-bearing LLMs (parent /
+ * subagent / research / no-tools), NOT the cheap aux housekeeping model.
+ */
+function reasoningModelKwargs(): Record<string, unknown> {
+  const raw = (process.env.REASONING_EFFORT ?? "").trim().toLowerCase();
+  if (!raw || raw === "off" || raw === "none" || raw === "0") return {};
+  const allowed = new Set(["minimal", "low", "medium", "high"]);
+  if (!allowed.has(raw)) {
+    console.warn(`[llm] Ignoring REASONING_EFFORT="${raw}" — expected one of minimal|low|medium|high.`);
+    return {};
+  }
+  return { modelKwargs: { reasoning_effort: raw } };
+}
+
+const REASONING_KWARGS = reasoningModelKwargs();
+if (Object.keys(REASONING_KWARGS).length > 0) {
+  console.log(`[llm] Extended thinking enabled: reasoning_effort=${(REASONING_KWARGS.modelKwargs as any).reasoning_effort}`);
+}
+
+/**
+ * Low-effort sibling of REASONING_KWARGS — used to break a rumination spiral.
+ * When a generation TIMES OUT (the model thinks so long it never emits a tool
+ * call or an answer within the per-call budget — the GAIA "0 tools, 300s,
+ * empty" failure), `invokeWithRetry` retries with a low-effort LLM so the model
+ * stops over-thinking and commits to acting/answering. Only meaningful when the
+ * operator opted into reasoning_effort; otherwise it's empty and the swap is a
+ * no-op (the retry just reuses the normal LLM — zero behavior change).
+ */
+const REASONING_KWARGS_LOW: Record<string, unknown> =
+  Object.keys(REASONING_KWARGS).length > 0 ? { modelKwargs: { reasoning_effort: "low" } } : {};
 
 /**
  * Tool registries.
@@ -106,6 +192,7 @@ const LLM_CALL_TUNING = { timeout: getLlmTimeoutMs(), maxRetries: 0 } as const;
  */
 export const parentTools = [
   runPythonTool,
+  runPythonWithToolsTool,
   runTerminalTool,
   runNodeTool,
   installPackagesTool,
@@ -121,8 +208,11 @@ export const parentTools = [
   createArtifactTool,
   capabilityCatalogTool,
   downloadVideoTool,
+  transcribeAudioTool,
   officialAndroidAppTool,
   searchWebTool,
+  researchTool,
+  financeResearchTool,
   browseWebTool,
   browserInteractTool,
   sandboxBrowserTool,
@@ -130,10 +220,12 @@ export const parentTools = [
   semanticSearchTool,
   clarifyTool,
   cronjobTool,
+  kanbanTool,
   todoTool,
   patchFileTool,
   skillViewTool,
   skillManageTool,
+  recallRunsTool,
   storeMemoryTool,
   searchMemoryTool,
   deleteMemoryTool,
@@ -199,6 +291,14 @@ let subagentLLMImpl: any;
 let noToolsLLMImpl: any;
 let researchLLMImpl: any;
 let subagentResearchLLMImpl: any;
+// Low-effort siblings — same model/tools, reasoning_effort forced to "low". Only
+// built when the operator opted into reasoning_effort; otherwise null and the
+// proxies fall back to the normal impls (zero behavior change). Used by
+// invokeWithRetry to break a rumination-timeout spiral (see REASONING_KWARGS_LOW).
+let agentLLMLowImpl: any = null;
+let subagentLLMLowImpl: any = null;
+let researchLLMLowImpl: any = null;
+let subagentResearchLLMLowImpl: any = null;
 let failoverAgentLLMImpl: any = null;
 let failoverSubagentLLMImpl: any = null;
 let auxLLMImpl: any = null;
@@ -207,7 +307,7 @@ let auxLLMImpl: any = null;
  * Bind tools to an LLM, sanitizing their JSON schemas for Moonshot/Kimi first.
  *
  * Kimi rejects standard OpenAI schemas with HTTP 400, which silently degrades
- * tool-calling into the raw-token leak we patch in `hermes-tokens.ts`. When the
+ * tool-calling into the raw-token leak we patch in `tool-call-recovery.ts`. When the
  * target model is Moonshot/Kimi we convert each tool to OpenAI format, run the
  * schema through `sanitizeMoonshotTools`, and bind the repaired dicts. For any
  * other model we bind the tools unchanged (zero behavior change).
@@ -228,13 +328,13 @@ function bindToolsForModel(llm: any, tools: any[], modelName: string) {
 
 function rebindLLMs(): void {
   agentLLMImpl = bindToolsForModel(
-    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...cfConfig }),
+    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS, ...cfConfig }),
     parentTools,
     MODEL_NAME
   );
 
   subagentLLMImpl = bindToolsForModel(
-    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...cfConfig }),
+    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS, ...cfConfig }),
     subagentTools,
     MODEL_NAME
   );
@@ -244,20 +344,52 @@ function rebindLLMs(): void {
     temperature: 0.2,
     streaming: true,
     ...LLM_CALL_TUNING,
+    ...REASONING_KWARGS,
     ...cfConfig,
   });
 
   researchLLMImpl = bindToolsForModel(
-    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...cfConfig }),
+    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS, ...cfConfig }),
     parentTools,
     MODEL_NAME
   );
 
   subagentResearchLLMImpl = bindToolsForModel(
-    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...cfConfig }),
+    new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS, ...cfConfig }),
     subagentTools,
     MODEL_NAME
   );
+
+  // Low-effort siblings — only meaningful when reasoning_effort is opted-in.
+  // When REASONING_KWARGS_LOW is empty these are identical to the normal impls,
+  // so the timeout-retry swap is a harmless no-op.
+  if (Object.keys(REASONING_KWARGS_LOW).length > 0) {
+    agentLLMLowImpl = bindToolsForModel(
+      new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS_LOW, ...cfConfig }),
+      parentTools,
+      MODEL_NAME
+    );
+    subagentLLMLowImpl = bindToolsForModel(
+      new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS_LOW, ...cfConfig }),
+      subagentTools,
+      MODEL_NAME
+    );
+    researchLLMLowImpl = bindToolsForModel(
+      new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS_LOW, ...cfConfig }),
+      parentTools,
+      MODEL_NAME
+    );
+    subagentResearchLLMLowImpl = bindToolsForModel(
+      new ChatOpenAI({ modelName: MODEL_NAME, temperature: 0.4, streaming: true, ...LLM_CALL_TUNING, ...REASONING_KWARGS_LOW, ...cfConfig }),
+      subagentTools,
+      MODEL_NAME
+    );
+  } else {
+    agentLLMLowImpl = null;
+    subagentLLMLowImpl = null;
+    researchLLMLowImpl = null;
+    subagentResearchLLMLowImpl = null;
+  }
 
   if (failoverConfig) {
     failoverAgentLLMImpl = bindToolsForModel(
@@ -304,6 +436,15 @@ export const subagentLLM = makeLiveProxy(() => subagentLLMImpl);
 export const noToolsLLM = makeLiveProxy(() => noToolsLLMImpl);
 export const researchLLM = makeLiveProxy(() => researchLLMImpl);
 export const subagentResearchLLM = makeLiveProxy(() => subagentResearchLLMImpl);
+
+// Low-effort siblings — fall back to the normal impl when reasoning_effort
+// wasn't opted in (so the timeout-retry swap is a safe no-op in that case).
+export const agentLLMLow = makeLiveProxy(() => agentLLMLowImpl ?? agentLLMImpl);
+export const subagentLLMLow = makeLiveProxy(() => subagentLLMLowImpl ?? subagentLLMImpl);
+export const researchLLMLow = makeLiveProxy(() => researchLLMLowImpl ?? researchLLMImpl);
+export const subagentResearchLLMLow = makeLiveProxy(() => subagentResearchLLMLowImpl ?? subagentResearchLLMImpl);
+/** True when low-effort variants are distinct from the normal ones (operator opted into reasoning_effort). */
+export const REASONING_LOW_AVAILABLE = Object.keys(REASONING_KWARGS_LOW).length > 0;
 
 /**
  * Auxiliary LLM for cheap, no-tools housekeeping work (background review,

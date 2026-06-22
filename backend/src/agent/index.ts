@@ -14,6 +14,7 @@ import { getSkillIndexText } from "../skills";
 import { registerSpawnSubagentRunner, registerSpawnSubagentBatchRunner, withSubagentBindings } from "../tools_extra";
 import { checkpointStore, RunCheckpoint, snapshotRunCtx } from "./checkpoint";
 import { registerCronRunner } from "./cron";
+import { registerKanbanWorkerRunner } from "./kanban";
 import { memoryStore } from "./memory";
 import { resetTodoStore } from "./todo";
 
@@ -34,12 +35,13 @@ import {
 import { MODEL_NAME } from "./llm";
 import { createAgentGraph } from "./loop";
 import { buildAgentSystemPrompt } from "./prompts";
-import { HermesStreamFilter, stripHermesToolTokens } from "./hermes-tokens";
+import { ToolCallStreamFilter, stripToolCallTokens } from "./tool-call-recovery";
 import {
   ThinkStreamFilter,
   extractInlineReasoning,
   extractStructuredReasoning,
 } from "./reasoning";
+import { explainEmptyFinal } from "./turn-explainer";
 import { ArtifactRegistry, FailureTracker } from "./registry";
 import { RunContext } from "./run-context";
 import { runSubagent, runSubagentBatch } from "./subagent";
@@ -72,6 +74,8 @@ export async function runAgentStream(
     clarificationGate?: ClarificationGate;
     /** Fire-and-forget hook with run metadata, called once on success. */
     onRunComplete?: (info: { toolsUsed: string[]; toolCallCount: number }) => void;
+    /** When "gaia", inject the strict GAIA exact-match answer-format contract. */
+    benchmarkMode?: "gaia";
   } = {}
 ): Promise<string> {
   return withApprovalContext(options.approvalGate, () =>
@@ -92,6 +96,7 @@ async function runAgentStreamInner(
     approvalGate?: ApprovalGate;
     clarificationGate?: ClarificationGate;
     onRunComplete?: (info: { toolsUsed: string[]; toolCallCount: number }) => void;
+    benchmarkMode?: "gaia";
   } = {}
 ): Promise<string> {
   // Input validation
@@ -140,6 +145,11 @@ async function runAgentStreamInner(
   }
 
   const runCtx = new RunContext(prompt, (options.history ?? []).length);
+  runCtx.benchmarkMode = options.benchmarkMode;
+  // Soft deadline: stop starting NEW tool calls once 80% of the hard run
+  // timeout has elapsed and force a final answer from what's gathered, so a
+  // long browse/search chain never times out with an EMPTY answer.
+  runCtx.softDeadlineAt = Date.now() + Math.floor(getRunTimeoutMs() * 0.8);
   // A brand-new conversation (no prior history) should start with a clean
   // task list — otherwise a plan left over from a previous conversation on
   // the same connection id would resurface. Mid-conversation turns keep the
@@ -155,19 +165,21 @@ async function runAgentStreamInner(
   const failureTracker = new FailureTracker();
   const streamedModelRuns = new Map<string, boolean>();
   const toolStartTimes = new Map<string, number>();
-  // Per-model-run filter that strips leaked Kimi/Hermes tool-call tokens from
-  // the streamed text so the UI never sees raw `<|tool_call_begin|>…` markup.
-  const hermesFilters = new Map<string, HermesStreamFilter>();
-  function getHermesFilter(runId: string): HermesStreamFilter {
-    let f = hermesFilters.get(runId);
-    if (!f) { f = new HermesStreamFilter(); hermesFilters.set(runId, f); }
+  // Per-model-run filter that strips leaked native tool-call tokens (Kimi, GLM,
+  // …) from the streamed text so the UI never sees raw `<|tool_call_begin|>…` or
+  // `<tool_call>…</tool_call>` markup. One model-agnostic filter handles every
+  // format (see tool-call-recovery.ts).
+  const toolTokenFilters = new Map<string, ToolCallStreamFilter>();
+  function getToolTokenFilter(runId: string): ToolCallStreamFilter {
+    let f = toolTokenFilters.get(runId);
+    if (!f) { f = new ToolCallStreamFilter(); toolTokenFilters.set(runId, f); }
     return f;
   }
   // Per-model-run filter that separates inline reasoning tags
   // (<think>…</think>, <REASONING_SCRATCHPAD>…) from the visible answer text.
-  // Runs AFTER the Hermes tool-token filter so it only sees plain prose +
-  // reasoning tags. Streamed reasoning goes to the thinking pane; only the
-  // remaining answer text is buffered as a candidate final answer.
+  // Runs AFTER the tool-token filter so it only sees plain prose + reasoning
+  // tags. Streamed reasoning goes to the thinking pane; only the remaining
+  // answer text is buffered as a candidate final answer.
   const thinkFilters = new Map<string, ThinkStreamFilter>();
   function getThinkFilter(runId: string): ThinkStreamFilter {
     let f = thinkFilters.get(runId);
@@ -189,6 +201,12 @@ async function runAgentStreamInner(
   // doing work — its prose ("Plan: 1)…", "I need to re-run…") is THINKING,
   // not the answer, and must NOT land in the answer bubble or saved history.
   const runContentBuffer = new Map<string, string>();
+  // Runs whose answer text we optimistically streamed live to the answer
+  // bubble (so the user sees it token-by-token, not dumped at turn end).
+  const liveAnswerRuns = new Set<string>();
+  // Runs detected to be tool-calling turns — their prose is intermediate
+  // narration, not the answer, so it stays out of the answer bubble.
+  const toolTurnRuns = new Set<string>();
 
   // ─── Checkpoint bookkeeping ──────────────────────────────────────────────
   // Persist a JSON snapshot at every meaningful state transition so a crash
@@ -244,6 +262,7 @@ async function runAgentStreamInner(
       memorySummary: memoryStore.getSummary(),
       complexity: runCtx.complexity,
       isParent: true,
+      benchmarkMode: options.benchmarkMode,
     });
     const systemMessage = { role: "system" as const, content: systemContent };
     throwIfAborted(runSignal);
@@ -261,6 +280,26 @@ async function runAgentStreamInner(
       { version: "v2", recursionLimit: getMaxAgentSteps(), signal: runSignal }
     );
 
+    // The model often recites its system-prompt classification + memory back as
+    // "reasoning" ("The user asked X, I should respond in Burmese, from the
+    // search results..."). That recitation is pure noise and makes a quick
+    // lookup look like overthinking. Only COMPLEX multi-step work has a thinking
+    // trace worth following; for simple + moderate queries we suppress the live
+    // reasoning stream and show only tool-activity cards + the final answer.
+    // (tool_start/tool_end events are separate, so Search/Browse cards still show.)
+    const suppressReasoning = runCtx.complexity !== "complex";
+    // Stream the answer token-by-token to the bubble ONLY for simple queries.
+    // Simple queries run the no-tools LLM, so they can NEVER turn into a tool
+    // turn — meaning the live text never has to be retracted. Moderate/complex
+    // queries may emit narration and THEN call a tool; streaming that live and
+    // retracting it via answer_reset is what made text "appear then vanish".
+    // Those emit their final answer once at turn end instead.
+    const streamAnswerLive = runCtx.complexity === "simple";
+    const emitReasoning = (content: string) => {
+      if (suppressReasoning) return;
+      emitEvent({ type: "reasoning_chunk", content });
+    };
+
     for await (const event of eventStream) {
       throwIfAborted(runSignal);
       const { event: eventType, name, data, run_id, tags } = event as any;
@@ -277,54 +316,67 @@ async function runAgentStreamInner(
         // `reasoning`, OpenRouter `reasoning_details[]`). Stream it straight to
         // the thinking pane — it is NEVER part of the answer.
         const nativeReasoning = extractStructuredReasoning(data.chunk);
-        if (nativeReasoning) emitEvent({ type: "reasoning_chunk", content: redactSecrets(nativeReasoning) });
+        if (nativeReasoning) emitReasoning(redactSecrets(nativeReasoning));
+        // A chunk carrying tool-call deltas means THIS run is a tool-calling
+        // turn — its prose is intermediate narration, not the answer. Mark it
+        // early so we never stream that prose into the answer bubble.
+        const chunkToolCalls = (data.chunk as any)?.tool_call_chunks ?? (data.chunk as any)?.tool_calls ?? [];
+        if (Array.isArray(chunkToolCalls) && chunkToolCalls.length > 0) toolTurnRuns.add(run_id);
         const text = contentToText(data.chunk?.content);
         if (text) {
           streamedModelRuns.set(run_id, true);
-          // 1. Strip any leaked Kimi/Hermes tool-call tokens before display.
-          const visible = getHermesFilter(run_id).push(text);
+          // 1. Strip any leaked native tool-call tokens (Kimi, GLM, …) before
+          // display. One model-agnostic filter handles every format.
+          const visible = getToolTokenFilter(run_id).push(text);
           if (visible) {
             // 2. Separate inline reasoning tags from the answer text. Inline
             // reasoning streams to the thinking pane; only the answer text is
             // buffered as a candidate final answer.
             const { answer, reasoning } = getThinkFilter(run_id).push(visible);
             if (reasoning) {
-              emitEvent({ type: "reasoning_chunk", content: redactSecrets(reasoning) });
+              emitReasoning(redactSecrets(reasoning));
               maybeSaveCheckpoint();
             }
             if (answer) {
-              // Stream answer text as live THINKING and buffer it. At turn end
-              // we decide if this run was the final answer or just
-              // intermediate narration; only the final answer is promoted to
-              // the answer bubble + saved history.
               const safeText = redactSecrets(answer);
               runContentBuffer.set(run_id, (runContentBuffer.get(run_id) ?? "") + safeText);
-              emitEvent({ type: "reasoning_chunk", content: safeText });
+              // Simple queries (no tools) stream the answer LIVE to the bubble so
+              // the user watches it build token-by-token — they can never become
+              // a tool turn, so the live text never needs retracting. Everything
+              // else buffers silently and emits the final answer once at turn end
+              // (moderate/complex used to stream-then-retract, which made text
+              // flash on screen and vanish when a tool call followed).
+              if (streamAnswerLive && !finalAnswerEmitted && !toolTurnRuns.has(run_id)) {
+                liveAnswerRuns.add(run_id);
+                emitEvent({ type: "thought_chunk", content: safeText });
+              } else {
+                emitReasoning(safeText);
+              }
               maybeSaveCheckpoint();
             }
           }
         }
       } else if (eventType === "on_chat_model_end") {
-        // Flush both filters: Hermes tool-token filter first, then the inline
-        // reasoning splitter, so any held-back tail is resolved.
-        const tail = getHermesFilter(run_id).flush();
+        // Flush the tool-token filter, then the inline reasoning splitter, so
+        // any held-back tail is resolved by whichever stage owns it.
+        const tail = getToolTokenFilter(run_id).flush();
         if (tail) {
           const { answer, reasoning } = getThinkFilter(run_id).push(tail);
-          if (reasoning) emitEvent({ type: "reasoning_chunk", content: redactSecrets(reasoning) });
+          if (reasoning) emitReasoning(redactSecrets(reasoning));
           if (answer) {
             const safeAnswer = redactSecrets(answer);
             runContentBuffer.set(run_id, (runContentBuffer.get(run_id) ?? "") + safeAnswer);
-            emitEvent({ type: "reasoning_chunk", content: safeAnswer });
+            emitReasoning(safeAnswer);
           }
           maybeSaveCheckpoint();
         }
         // Flush whatever the think filter still holds.
         const thinkTail = getThinkFilter(run_id).flush();
-        if (thinkTail.reasoning) emitEvent({ type: "reasoning_chunk", content: redactSecrets(thinkTail.reasoning) });
+        if (thinkTail.reasoning) emitReasoning(redactSecrets(thinkTail.reasoning));
         if (thinkTail.answer) {
           const safeAnswer = redactSecrets(thinkTail.answer);
           runContentBuffer.set(run_id, (runContentBuffer.get(run_id) ?? "") + safeAnswer);
-          emitEvent({ type: "reasoning_chunk", content: safeAnswer });
+          emitReasoning(safeAnswer);
           maybeSaveCheckpoint();
         }
 
@@ -332,35 +384,55 @@ async function runAgentStreamInner(
         // final aggregated message (some providers don't stream it as deltas).
         const endReasoning = extractStructuredReasoning(data.output);
         if (endReasoning && !streamedModelRuns.get(run_id)) {
-          emitEvent({ type: "reasoning_chunk", content: redactSecrets(endReasoning) });
+          emitReasoning(redactSecrets(endReasoning));
         }
 
         // Non-streamed providers: capture the full content for this run,
         // separating inline reasoning tags from the answer. Reasoning goes to
         // the thinking pane; only the answer text is buffered.
         if (!streamedModelRuns.get(run_id)) {
-          const raw = stripHermesToolTokens(contentToText(data.output?.content));
+          const raw = stripToolCallTokens(contentToText(data.output?.content));
           const { reasoning, cleaned } = extractInlineReasoning(raw);
-          if (reasoning) emitEvent({ type: "reasoning_chunk", content: redactSecrets(reasoning) });
+          if (reasoning) emitReasoning(redactSecrets(reasoning));
           if (cleaned) runContentBuffer.set(run_id, redactSecrets(cleaned));
         }
 
         // Decide: was this turn the FINAL answer or intermediate narration?
         // A turn that emitted tool_calls is doing work — its prose is
-        // thinking, already shown via reasoning_chunk; drop it from the
-        // answer. A turn with NO tool calls is the real answer.
+        // thinking, not the answer. A turn with NO tool calls is the real answer.
         const toolCallsOut = (data.output as any)?.tool_calls
           ?? (data.output as any)?.additional_kwargs?.tool_calls
           ?? [];
+        const isToolTurn = (Array.isArray(toolCallsOut) && toolCallsOut.length > 0) || toolTurnRuns.has(run_id);
+        const wasStreamedLive = liveAnswerRuns.has(run_id);
         const buffered = (runContentBuffer.get(run_id) ?? "").trim();
-        if (buffered && (!Array.isArray(toolCallsOut) || toolCallsOut.length === 0)) {
-          // Strip any internal plan/intent preamble so it never reaches the
-          // answer bubble or saved history.
+
+        if (isToolTurn) {
+          // Intermediate work turn. If we optimistically streamed some prose to
+          // the answer bubble before the tool call surfaced, retract it.
+          if (wasStreamedLive) {
+            emitEvent({ type: "answer_reset" });
+            liveAnswerRuns.delete(run_id);
+          }
+        } else if (buffered) {
           const cleaned = stripPlanPreamble(buffered);
-          if (cleaned) {
-            // If a prior final answer was already emitted (critic-driven
-            // revision), REPLACE it — don't append. Tell the client to reset
-            // the answer bubble so the user sees only the final revision.
+          if (wasStreamedLive) {
+            // Already streamed token-by-token to the bubble. Record it for
+            // history; only re-emit if preamble-stripping changed the text.
+            if (cleaned !== buffered) {
+              assistantTextChunks.length = 0;
+              emitEvent({ type: "answer_reset" });
+              if (cleaned) emitEvent({ type: "thought_chunk", content: cleaned });
+            }
+            if (cleaned) {
+              finalAnswerEmitted = true;
+              assistantTextChunks.push(cleaned);
+            }
+            maybeSaveCheckpoint();
+          } else if (cleaned) {
+            // Not streamed live (reasoning shown, or complex query) — emit now.
+            // If a prior final answer was already shown (critic-driven
+            // revision), reset the bubble so only the revision remains.
             if (finalAnswerEmitted) {
               assistantTextChunks.length = 0;
               emitEvent({ type: "answer_reset" });
@@ -372,6 +444,7 @@ async function runAgentStreamInner(
           }
         }
         runContentBuffer.delete(run_id);
+        liveAnswerRuns.delete(run_id);
       } else if (eventType === "on_tool_start") {
         toolStartTimes.set(run_id, Date.now());
         const toolInput = normalizeToolInput(data.input);
@@ -436,9 +509,21 @@ async function runAgentStreamInner(
     } catch { /* ignore */ }
     return finalText;
   } catch (error: any) {
-    if (error instanceof AgentTimeoutError) {
+    // Treat BOTH a run-level timeout (AgentTimeoutError) AND an exhausted
+    // per-call timeout (a plain Error with name "TimeoutError", thrown by
+    // invokeWithRetry when every retry of one model call timed out) as a
+    // graceful timeout. Without this, a model that spirals on a hard
+    // reasoning task — never completing a single call — crashed the whole run
+    // to an EMPTY answer instead of returning the partial/banner the user
+    // expects. (Both are name "TimeoutError"; AgentAbortError is "AbortError".)
+    const isTimeout = error instanceof AgentTimeoutError || error?.name === "TimeoutError";
+    if (isTimeout) {
       const partial = assistantTextChunks.join("").trim();
       const timeoutMsg = "⏱️ The agent run timed out. Here's what was completed so far:";
+      // Emit the banner as a UI event ONLY. We deliberately do NOT append it to
+      // the returned text: downstream consumers (notably the GAIA scorer's
+      // last-non-empty-line fallback) would otherwise treat the banner as the
+      // answer, clobbering any `FINAL ANSWER:` line the model already streamed.
       emitEvent({ type: "thought_chunk", content: `\n\n${timeoutMsg}` });
       console.warn(`[agent:timeout] Run timed out after ${getRunTimeoutMs() / 1000}s`);
       trajectory.logStep({ node: "timeout", error: "AgentTimeoutError" });
@@ -449,7 +534,11 @@ async function runAgentStreamInner(
       checkpoint.partialAnswer = redactSecrets(partial).slice(0, 16_000);
       maybeSaveCheckpoint(true);
       emitEvent({ type: "run_checkpoint", runId: checkpoint.runId, status: "interrupted" });
-      return partial ? `${partial}\n\n${timeoutMsg}` : timeoutMsg;
+      // Return the salvaged partial (it may carry a `FINAL ANSWER:` line) when we
+      // have one. Otherwise return an HONEST explanation from the turn explainer
+      // rather than the raw banner placeholder — the banner was scoring as the
+      // model's answer on empty timeouts (the GAIA `timeout_0_tools` garbage).
+      return partial || explainEmptyFinal("", "timeout", true);
     }
     trajectory.logStep({ node: "error", error: error?.message ?? String(error) });
     trajectory.flushToDisk();
@@ -483,6 +572,17 @@ registerSpawnSubagentBatchRunner((tasks, parentArtifacts, parentSignal, options)
 // ArtifactRegistry and an empty history per tick — scheduled tasks should
 // be self-contained, NOT inherit some other run's chat memory.
 registerCronRunner(async (task: string) => {
+  const noopEmit = () => {};
+  return runAgentStream(task, noopEmit, {
+    history: [],
+    artifactRegistry: new ArtifactRegistry(),
+  });
+});
+
+// Wire Kanban workers into the in-process agent. Each worker runs one task's
+// self-contained prompt with a fresh ArtifactRegistry and no history — same
+// isolation contract as cron, since board tasks carry their own context.
+registerKanbanWorkerRunner(async (task: string) => {
   const noopEmit = () => {};
   return runAgentStream(task, noopEmit, {
     history: [],

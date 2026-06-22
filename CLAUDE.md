@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Candle — Project Memory
 
 > Mobile-first, sandboxed, multi-tier-memory autonomous agent app.
@@ -181,8 +185,11 @@ npm install
 npm run dev                        # ts-node src/server.ts
 npm run build && npm run start     # tsc → dist/, then node dist/server.js
 npm run typecheck                  # tsc --noEmit
+npm run lint | lint:fix            # eslint . (--fix to autofix)
 npm run test                       # vitest run
+npm run test:watch                 # vitest (watch a single file: npm run test:watch -- budget)
 npm run skills:mine                # offline skill miner over data/checkpoints/
+npm run smoke:e2e                  # ts-node scripts/smoke-e2e.ts (end-to-end smoke test)
 npm run e2b:template:create        # build the E2B sandbox image
 ```
 
@@ -248,9 +255,6 @@ WebSocket events (discriminated by `type`): `prompt`, `ping/pong`,
 
 ## Known leftovers / gaps to watch
 
-- `app/(tabs)/index.tsx`, `app/(tabs)/explore.tsx`, `app/modal.tsx` are
-  unmodified Expo starter scaffolding and are NOT wired into the real
-  navigation in `app/_layout.tsx`. Either delete or repurpose them.
 - Two browser stacks coexist: Kernel-driven `browser_interact` (needs
   `KERNEL_API_KEY`) and in-sandbox Playwright `sandbox_browser`. Prompts
   steer the model, but operators should pick one when budget matters.

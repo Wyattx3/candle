@@ -12,6 +12,16 @@ export class RunContext {
   readonly prompt: string;
   budget: ToolBudget;
   complexity: QueryComplexity;
+  /**
+   * Set to "gaia" when running under the GAIA benchmark harness. The critic
+   * uses this to run an answer-FORMAT auditor (unit/scale/separator/ordering
+   * reconciliation) regardless of complexity — GAIA grades by exact match, so a
+   * right value in the wrong unit ("17000" when asked for thousands → "17")
+   * scores zero, and the normal critic is skipped on non-complex tasks.
+   */
+  benchmarkMode?: "gaia";
+  /** One-shot guard so the GAIA format auditor can never loop. */
+  gaiaFormatAudited = false;
   toolCallCount = 0;
   searchCallCount = 0;
   browseCallCount = 0;
@@ -22,8 +32,23 @@ export class RunContext {
   budgetExceeded = false;
   /** Which limit tripped budgetExceeded — for accurate logging + nudges. */
   budgetExceededReason: string | null = null;
+  /**
+   * Absolute wall-clock time (ms epoch) past which the loop should stop
+   * starting new tool calls and force a final answer instead. Set from
+   * `index.ts` to a fraction of the hard run timeout, so a long browse/search
+   * chain never burns the whole budget and times out with an EMPTY answer —
+   * the user always gets the best result from what was gathered. null = unset.
+   */
+  softDeadlineAt: number | null = null;
   /** Set once the empty-final-answer recovery pass has fired, so it can't loop. */
   emptyAnswerRecovered = false;
+  /**
+   * Set once the output-degeneration recovery pass has fired. GLM-5.2 sometimes
+   * collapses mid-generation into repeated garbage ("Let me research...Let me",
+   * "0:0|0>0|0)2)"); we discard that and retry ONCE with a constrained prompt.
+   * One-shot so a model that keeps collapsing can't loop the recovery forever.
+   */
+  degenerationRecovered = false;
   /** Anti-thrash counter for context compression — backs off after 2 weak passes. */
   ineffectiveCompressionCount = 0;
   recentModelOutputs: string[] = [];
@@ -32,6 +57,17 @@ export class RunContext {
   loopNudgeSent = false;
   /** Set once the "state your reasoning" nudge has fired, so it stays one-shot. */
   reasoningReminderSent = false;
+  /**
+   * Count of code-execution calls (run_python / run_terminal / run_node). A high
+   * count with no final answer is the "incremental REPL flailing" anti-pattern:
+   * the model pokes a file/problem one tiny snippet at a time, never consolidating
+   * into a single end-to-end solver, and burns its whole budget/time before
+   * producing an answer (see GAIA maze task 65afbc8a). detectLoop misses this
+   * because each snippet's args differ. We fire a one-shot consolidation nudge.
+   */
+  codeExecCount = 0;
+  /** Set once the "consolidate into one script" nudge has fired, so it's one-shot. */
+  consolidationNudgeSent = false;
   /** Tracks tool failures so the model can see them in context */
   pendingFailureHint: string | null = null;
   guardrails: ToolCallGuardrailController = new ToolCallGuardrailController();
@@ -49,32 +85,36 @@ export class RunContext {
     this.toolCallCount++;
     if (toolName === "search_web") this.searchCallCount++;
     if (toolName === "browse_web") this.browseCallCount++;
+    if (toolName === "run_python" || toolName === "run_terminal" || toolName === "run_node") {
+      this.codeExecCount++;
+    }
     this.costScore += toolCostWeight(toolName);
     if (this.toolsUsed.length < 100) this.toolsUsed.push(toolName);
 
-    if (
-      this.toolCallCount > this.budget.maxToolCalls ||
-      this.searchCallCount > this.budget.maxSearchCalls ||
-      this.browseCallCount > this.budget.maxBrowseCalls ||
-      this.costScore > this.costCeiling
-    ) {
+    // Overall tool-call budget stays generous so Execute/build tasks (many
+    // file/run ops) aren't choked. But search is the spiral-prone tool: the
+    // model will re-query forever if unchecked (re-running near-identical
+    // searches, never converging to an answer, eventually flooding the provider
+    // into a 429). So we ALSO hard-cap searches+browses specifically — hitting
+    // the search cap forces a tool-less final answer from what's already
+    // gathered. The weighted cost ceiling stays telemetry-only.
+    if (this.toolCallCount > this.budget.maxToolCalls) {
       this.budgetExceeded = true;
-      if (this.toolCallCount > this.budget.maxToolCalls) {
-        this.budgetExceededReason = `tool calls ${this.toolCallCount}/${this.budget.maxToolCalls}`;
-      } else if (this.searchCallCount > this.budget.maxSearchCalls) {
-        this.budgetExceededReason = `searches ${this.searchCallCount}/${this.budget.maxSearchCalls}`;
-      } else if (this.browseCallCount > this.budget.maxBrowseCalls) {
-        this.budgetExceededReason = `browses ${this.browseCallCount}/${this.budget.maxBrowseCalls}`;
-      } else {
-        this.budgetExceededReason = `weighted cost ${this.costScore}/${this.costCeiling}`;
-      }
+      this.budgetExceededReason = `tool calls ${this.toolCallCount}/${this.budget.maxToolCalls}`;
+      return "exceeded";
+    }
+    if (this.searchCallCount > this.budget.maxSearchCalls) {
+      this.budgetExceeded = true;
+      this.budgetExceededReason = `searches ${this.searchCallCount}/${this.budget.maxSearchCalls} — answer from what you have`;
+      return "exceeded";
+    }
+    if (this.browseCallCount > this.budget.maxBrowseCalls) {
+      this.budgetExceeded = true;
+      this.budgetExceededReason = `browses ${this.browseCallCount}/${this.budget.maxBrowseCalls} — answer from what you have`;
       return "exceeded";
     }
 
-    if (
-      (this.toolCallCount >= this.budget.warningAt || this.costScore >= this.costCeiling * 0.75) &&
-      !this.budgetWarningIssued
-    ) {
+    if (this.toolCallCount >= this.budget.warningAt && !this.budgetWarningIssued) {
       this.budgetWarningIssued = true;
       return "warning";
     }

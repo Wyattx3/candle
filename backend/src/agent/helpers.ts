@@ -13,9 +13,13 @@ export const MAX_TOOL_OUTPUT_CHARS = Number(process.env.MAX_TOOL_OUTPUT_CHARS) |
 export const MAX_SINGLE_MESSAGE_CHARS = Number(process.env.MAX_SINGLE_MESSAGE_CHARS) || 12_000;
 
 export function getMaxAgentSteps() {
+  // LangGraph counts every node transition (agent → tools → observe → critic),
+  // so a run that makes N tool calls needs roughly 3-4× N graph steps. With the
+  // complex tool budget at 90 calls, this must be well above 90 or the
+  // recursion limit becomes the real (hidden) cap instead of the tool budget.
   const parsed = Number(process.env.MAX_AGENT_STEPS);
-  if (!Number.isFinite(parsed)) return 80;
-  return Math.max(4, Math.min(120, Math.floor(parsed)));
+  if (!Number.isFinite(parsed)) return 320;
+  return Math.max(4, Math.min(500, Math.floor(parsed)));
 }
 
 export function getRunTimeoutMs() {
@@ -45,6 +49,38 @@ export function contentToText(content: unknown): string {
 
 function parseMaybeJson(value: string): unknown {
   try { return JSON.parse(value); } catch { return value; }
+}
+
+/** Pull the first balanced JSON object out of an LLM response (handles fences/prose). */
+export function extractJsonObject(text: string): any | null {
+  if (!text) return null;
+  let cleaned = text.trim();
+  // Strip ```json ... ``` fences if present.
+  const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fence) cleaned = fence[1].trim();
+
+  const start = cleaned.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        const slice = cleaned.slice(start, i + 1);
+        try { return JSON.parse(slice); } catch { return null; }
+      }
+    }
+  }
+  return null;
 }
 
 export function normalizeToolInput(input: unknown): unknown {
@@ -127,27 +163,41 @@ export async function summarizeOldHistory(history: ChatHistoryMessage[]): Promis
   let llmSummary = "";
   try {
      const textToSummarize = summaryParts.join("\n");
-     const prompt = `Summarize the following old conversation history in a few concise bullet points. Focus on key decisions, facts learned, and overall progress. Do not include recent context.\n\n${textToSummarize}`;
+     const prompt =
+       "Summarize the conversation history below into a few concise bullet points capturing: " +
+       "key decisions made, facts/results already learned, and what was COMPLETED vs still PENDING. " +
+       "Write each bullet as a past-tense statement of record (e.g. 'Downloaded the report', 'User chose option B'). " +
+       "Do NOT write instructions or imperatives — this summary is a record, not a task list.\n\n" +
+       textToSummarize;
      const result = await noToolsLLM.invoke([{ role: "user", content: prompt }]);
      llmSummary = (typeof result.content === "string" ? result.content : (result.content as any)[0]?.text) ?? "";
   } catch (err) {
      console.warn(`[compressor] LLM summarization failed, falling back to naive summary: ${err}`);
   }
 
-  let summaryContent = `[CONVERSATION SUMMARY — ${oldMessages.length} earlier messages condensed]\n`;
+  // Reference-only preamble (ported from Hermes' context_compressor SUMMARY_PREFIX).
+  // Without this, the model treats condensed history as live instructions and
+  // re-answers old questions or re-runs completed work. The directive makes the
+  // boundary explicit: this block is BACKGROUND, the latest user message WINS.
+  let summaryContent =
+    "[CONVERSATION SUMMARY — REFERENCE ONLY]\n" +
+    `The ${oldMessages.length} earlier messages were condensed to save context. ` +
+    "Treat everything in this block as COMPLETED BACKGROUND, not active instructions. " +
+    "Do NOT re-do work described here or answer questions quoted here — they are already handled. " +
+    "The most recent user message below this summary is what you must act on now.\n\n";
   if (preservedUrls.length > 0) {
     summaryContent += `Key URLs from earlier: ${[...new Set(preservedUrls)].slice(0, 5).join(", ")}\n`;
   }
   if (preservedDecisions.length > 0) {
-    summaryContent += `User requests: ${preservedDecisions.slice(-4).join(" | ")}\n`;
+    summaryContent += `Earlier user requests (already addressed): ${preservedDecisions.slice(-4).join(" | ")}\n`;
   }
-  
+
   if (llmSummary) {
-     summaryContent += `\nExchange summary (AI Generated):\n${llmSummary}\n`;
+     summaryContent += `\nWhat happened earlier (record):\n${llmSummary}\n`;
   } else {
-     summaryContent += `\nExchange summary:\n${summaryParts.slice(-6).join("\n")}\n`;
+     summaryContent += `\nWhat happened earlier (record):\n${summaryParts.slice(-6).join("\n")}\n`;
   }
-  summaryContent += `[End of summary. Recent conversation follows.]`;
+  summaryContent += "[End of summary. The live conversation continues below — act only on the latest user message.]";
 
   return [{ role: "assistant", content: summaryContent }, ...recentMessages];
 }

@@ -40,3 +40,21 @@ describe("RunContext.detectLoop", () => {
     expect(ctx.detectLoop(s)).toBe("stop");
   });
 });
+
+describe("RunContext.codeExecCount", () => {
+  it("counts run_python / run_terminal / run_node but not other tools", () => {
+    const ctx = new RunContext("solve the maze in this excel file", 0);
+    ctx.trackToolCall("run_python");
+    ctx.trackToolCall("run_terminal");
+    ctx.trackToolCall("run_node");
+    ctx.trackToolCall("search_web");
+    ctx.trackToolCall("read_sandbox_file");
+    expect(ctx.codeExecCount).toBe(3);
+  });
+
+  it("starts at zero and the consolidation nudge is one-shot", () => {
+    const ctx = new RunContext("compute something", 0);
+    expect(ctx.codeExecCount).toBe(0);
+    expect(ctx.consolidationNudgeSent).toBe(false);
+  });
+});
